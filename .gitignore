@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+.next/
+out/
+
+# Database
+*.db
+*.sqlite3
+
+# Audio uploads
+uploads/
+*.mp3
+*.wav
+*.mp4
+*.m4a
+*.ogg
+*.flac
+
+# ML models
+ml/models/*.pt
+ml/models/*.bin
+ml/models/*.safetensors
+ml/data/
+
+# Logs
+logs/
+*.log
+
+# Coverage
+htmlcov/
+.coverage
+coverage.xml
+
+# Claude
+.claude/
+
+# Docs
+job.md
