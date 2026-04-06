@@ -13,10 +13,11 @@ import os
 database_url = os.environ.get("DATABASE_URL", "")
 if database_url:
     # Railway uses postgres:// but SQLAlchemy needs postgresql://
+    # Alembic runs synchronously, so use psycopg2 (not asyncpg)
     if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif database_url.startswith("postgresql://") and "+asyncpg" not in database_url:
-        database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    # Strip asyncpg if present — Alembic needs sync driver
+    database_url = database_url.replace("postgresql+asyncpg://", "postgresql://")
     config.set_main_option("sqlalchemy.url", database_url)
 
 # Interpret the config file for Python logging.
