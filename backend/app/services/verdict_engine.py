@@ -8,8 +8,8 @@ import json
 import re
 from datetime import datetime, timezone
 
-import anthropic
 import structlog
+from openai import AsyncOpenAI
 
 from app.config import settings
 
@@ -52,7 +52,10 @@ Respond ONLY with a JSON object (no markdown, no explanation):
 
 class VerdictEngine:
     def __init__(self):
-        self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        self.client = AsyncOpenAI(
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
 
     async def generate_verdict(
         self,
@@ -70,13 +73,13 @@ class VerdictEngine:
         log.info("verdict_generate_start", claim=claim_text[:100], evidence_count=len(evidence))
 
         # If no evidence, return UNVERIFIED immediately
-        if len(evidence) < 2:
+        if len(evidence) < 1:
             return {
                 "verdict_label": "UNVERIFIED",
                 "confidence": None,
                 "rationale_summary": "Insufficient evidence retrieved to evaluate this claim.",
                 "rationale_bullets": [
-                    f"Only {len(evidence)} evidence passage(s) found; minimum 2 required for a verdict."
+                    f"Only {len(evidence)} evidence passage(s) found; minimum 1 required for a verdict."
                 ],
                 "what_would_change_verdict": "Additional authoritative sources addressing this specific claim.",
             }
@@ -103,17 +106,17 @@ class VerdictEngine:
 
         # Generate verdict (with retry on citation validation failure)
         for attempt in range(3):
-            response = await self.client.messages.create(
-                model="claude-sonnet-4-5-20250929",
+            response = await self.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
                 max_tokens=1500,
                 messages=[{"role": "user", "content": prompt}],
             )
 
-            text = response.content[0].text.strip()
+            text = response.choices[0].message.content.strip()
             verdict = self._parse_verdict(text)
 
             if verdict and self._validate_citations(verdict, evidence):
-                verdict["model_used"] = "claude-sonnet-4-5-20250929"
+                verdict["model_used"] = "gemini-2.0-flash"
                 verdict["prompt_hash"] = hashlib.sha256(prompt.encode()).hexdigest()[:16]
                 log.info(
                     "verdict_generate_done",
@@ -162,6 +165,22 @@ class VerdictEngine:
             log.warning("verdict_parse_error", raw=text[:200])
             return None
 
+    def _extract_non_trivial_words(self, text: str) -> set[str]:
+        """Extract normalized words suitable for lightweight citation overlap checks."""
+        return {
+            word
+            for word in re.findall(r"\b[a-z0-9']+\b", text.lower())
+            if len(word) > 3
+        }
+
+    def _get_citation_sentence(self, bullet: str, citation: str) -> str:
+        """Return the sentence containing a citation, falling back to the full bullet."""
+        sentences = re.split(r"(?<=[.!?])\s+", bullet)
+        for sentence in sentences:
+            if citation in sentence:
+                return sentence
+        return bullet
+
     def _validate_citations(self, verdict: dict, evidence: list[dict]) -> bool:
         """Validate that all [SOURCE_N] references map to actual evidence."""
         bullets = verdict.get("rationale_bullets", [])
@@ -175,8 +194,44 @@ class VerdictEngine:
             if int(cite_num) < 1 or int(cite_num) > max_source:
                 return False
 
+        for bullet in bullets:
+            bullet_citations = re.findall(r"\[SOURCE_(\d+)\]", bullet)
+            if not bullet_citations:
+                continue
+
+            bullet_words = self._extract_non_trivial_words(bullet)
+            for cite_num in bullet_citations:
+                citation = f"[SOURCE_{cite_num}]"
+                snippet = evidence[int(cite_num) - 1].get("snippet", "")
+                snippet_words = self._extract_non_trivial_words(snippet)
+                sentence = self._get_citation_sentence(bullet, citation)
+                sentence_words = self._extract_non_trivial_words(sentence)
+                overlap_count = len(snippet_words & (sentence_words | bullet_words))
+
+                if overlap_count == 0:
+                    log.warning(
+                        "verdict_citation_keyword_overlap_zero",
+                        source_num=int(cite_num),
+                        bullet=bullet[:240],
+                        snippet=snippet[:240],
+                    )
+
         # At least one bullet should have a citation (unless UNVERIFIED)
         if verdict.get("verdict_label") != "UNVERIFIED" and not citations:
+            return False
+
+        summary = verdict.get("rationale_summary", "")
+        summary_lower = summary.lower()
+        label = verdict.get("verdict_label", "").upper()
+
+        if label in {"TRUE", "MOSTLY_TRUE"} and re.search(
+            r"\b(false|incorrect|wrong|inaccurate)\b", summary_lower
+        ):
+            return False
+
+        if label in {"FALSE", "MOSTLY_FALSE"} and re.search(
+            r"\b(confirmed|accurate|correct|true)\b", summary_lower
+        ):
             return False
 
         return True
@@ -203,5 +258,6 @@ class VerdictEngine:
             "tier_5_other": 0.3,
         }
         f3 = max((tier_scores.get(t, 0.3) for t in source_tiers), default=0.3)
+        f4 = min(len({tier for tier in source_tiers if tier}) / 3.0, 1.0)
 
-        return round((f1 + f2 + f3) / 3.0, 2)
+        return round((0.20 * f1) + (0.35 * f2) + (0.30 * f3) + (0.15 * f4), 2)

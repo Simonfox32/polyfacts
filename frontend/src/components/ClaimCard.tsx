@@ -78,14 +78,15 @@ export function ClaimCard({ claim, isSelected, onClick }: Props) {
 
   return (
     <div
-      className={`rounded-lg border p-3 cursor-pointer transition-all ${
-        isSelected ? "border-black shadow-md" : "border-gray-200 hover:border-gray-400"
+      className={`cursor-pointer rounded-xl border bg-white p-4 shadow-sm transition-all ${
+        isSelected
+          ? "border-black shadow-md ring-1 ring-black/10"
+          : "border-gray-200 hover:-translate-y-0.5 hover:border-gray-300 hover:shadow-md"
       }`}
       onClick={onClick}
     >
-      {/* Verdict chip */}
-      <div className="flex items-center gap-2 mb-2">
-        <span className={`text-xs font-bold px-2 py-0.5 rounded ${colorClass}`}>
+      <div className="mb-2 flex items-center gap-2">
+        <span className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${colorClass}`}>
           {verdictLabel.replace("_", " ")}
         </span>
         {claim.verdict?.confidence != null && (
@@ -93,38 +94,34 @@ export function ClaimCard({ claim, isSelected, onClick }: Props) {
             {Math.round(claim.verdict.confidence * 100)}% confidence
           </span>
         )}
-        <span className="text-xs text-gray-400 ml-auto">
+        <span className="ml-auto text-xs text-gray-400">
           {formatMs(claim.timestamp_range.start_ms)}
         </span>
       </div>
 
-      {/* Claim text */}
-      <p className="text-sm leading-snug">
+      <p className="text-sm leading-snug text-gray-900">
         {claim.speaker && (
           <span className="font-medium">{claim.speaker.speaker_label}: </span>
         )}
         {claim.claim_text}
       </p>
 
-      {/* Rationale summary */}
       {claim.verdict?.rationale_summary && (
-        <p className="text-xs text-gray-600 mt-1.5 leading-relaxed">
+        <p className="mt-1.5 text-xs leading-relaxed text-gray-600">
           {claim.verdict.rationale_summary}
         </p>
       )}
 
-      {/* Expanded detail */}
       {isSelected && detail && (
-        <div className="mt-3 pt-3 border-t space-y-3">
-          {/* Rationale bullets */}
+        <div className="mt-3 space-y-3 border-t border-gray-100 pt-3">
           {detail.verdict?.rationale_bullets && detail.verdict.rationale_bullets.length > 0 && (
             <div>
-              <h4 className="text-xs font-semibold uppercase text-gray-500 mb-1">
+              <h4 className="mb-1 text-xs font-semibold uppercase text-gray-500">
                 Analysis
               </h4>
-              <ul className="text-xs space-y-1">
+              <ul className="space-y-1 text-xs">
                 {detail.verdict.rationale_bullets.map((bullet, i) => (
-                  <li key={i} className="leading-relaxed pl-3 relative">
+                  <li key={i} className="relative pl-3 leading-relaxed">
                     <span className="absolute left-0">-</span>
                     {bullet}
                   </li>
@@ -133,17 +130,19 @@ export function ClaimCard({ claim, isSelected, onClick }: Props) {
             </div>
           )}
 
-          {/* Sources */}
           {detail.sources && detail.sources.length > 0 && (
             <div>
-              <h4 className="text-xs font-semibold uppercase text-gray-500 mb-2">
+              <h4 className="mb-2 text-xs font-semibold uppercase text-gray-500">
                 Sources ({detail.sources.length})
               </h4>
               <div className="space-y-2.5">
                 {detail.sources.map((source, i) => (
-                  <div key={source.source_id || `src-${i}`} className="text-xs border-l-2 border-gray-200 pl-2">
+                  <div
+                    key={source.source_id || `src-${i}`}
+                    className="border-l-2 border-gray-200 pl-2 text-xs"
+                  >
                     <div className="flex items-start gap-1.5">
-                      <span className="shrink-0 px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-medium whitespace-nowrap mt-0.5">
+                      <span className="mt-0.5 shrink-0 whitespace-nowrap rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium">
                         {TIER_LABELS[source.source_tier] || source.source_tier}
                       </span>
                       <div className="min-w-0">
@@ -165,13 +164,12 @@ export function ClaimCard({ claim, isSelected, onClick }: Props) {
             </div>
           )}
 
-          {/* What would change */}
           {detail.what_would_change_verdict && (
             <div>
-              <h4 className="text-xs font-semibold uppercase text-gray-500 mb-1">
+              <h4 className="mb-1 text-xs font-semibold uppercase text-gray-500">
                 What would change this verdict?
               </h4>
-              <p className="text-xs text-gray-600 leading-relaxed">
+              <p className="text-xs leading-relaxed text-gray-600">
                 {detail.what_would_change_verdict}
               </p>
             </div>

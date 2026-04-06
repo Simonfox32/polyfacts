@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     deepgram_api_key: str = ""
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    gemini_api_key: str = ""
+    groq_api_key: str = ""
+    brave_search_api_key: str = ""
+    jwt_secret: str = "change-me-in-production"
+    access_token_expire_minutes: int = 1440
 
     # Government APIs
     bls_api_key: str = ""
@@ -23,7 +28,7 @@ class Settings(BaseSettings):
     congress_api_key: str = ""
 
     # Processing
-    claim_worthiness_threshold: float = 0.3
+    claim_worthiness_threshold: float = 0.5
     max_upload_size_mb: int = 500
     max_evidence_sources: int = 10
 

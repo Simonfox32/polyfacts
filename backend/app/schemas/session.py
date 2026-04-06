@@ -39,6 +39,28 @@ class SessionResponse(BaseModel):
     session_id: str
     title: str | None
     status: str
+    channel_name: str | None = None
     duration_seconds: int | None
+    media_type: str = "audio"
+    view_count: int = 0
     claims_count: int
+    verdict_distribution: dict[str, int] = {}
+    thumbnail_url: str | None = None
     created_at: datetime
+
+
+class SessionDetailResponse(BaseModel):
+    session_id: str
+    title: str | None
+    description: str | None = None
+    status: str
+    channel_name: str | None = None
+    broadcast_date: datetime | None = None
+    duration_seconds: int | None
+    media_type: str = "audio"
+    view_count: int = 0
+    claims_count: int
+    speakers: list[str] = []
+    verdict_distribution: dict[str, int] = {}
+    created_at: datetime
+    completed_at: datetime | None = None

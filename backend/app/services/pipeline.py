@@ -3,11 +3,12 @@
 Audio → ASR → Speaker ID → Claim Detection → Evidence Retrieval → Verdict Generation
 """
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
-import anthropic
 import structlog
+from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,7 +30,10 @@ class PipelineOrchestrator:
         self.detector = ClaimDetector()
         self.retriever = EvidenceRetriever()
         self.verdict_engine = VerdictEngine()
-        self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        self.groq_client = AsyncOpenAI(
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
 
     async def process_clip(self, session_id: str) -> None:
         """Process a clip through the full pipeline."""
@@ -43,11 +47,19 @@ class PipelineOrchestrator:
             # Stage 1: ASR
             await self._update_status(session, "processing", "asr", 10)
             segments = await self.asr.transcribe_file(session.audio_file_path)
+            if segments:
+                session.duration_seconds = segments[-1]["end_ms"] // 1000
             await self._update_status(session, "processing", "asr", 20)
 
-            # Stage 1.5: Speaker Identification
+            # Stage 1.5: LLM re-diarization (fixes Deepgram merging speakers)
+            await self._update_status(session, "processing", "diarization_fix", 21)
+            segments = await self._llm_rediarize(segments)
+
+            # Stage 1.6: Speaker Identification
             await self._update_status(session, "processing", "speaker_identification", 22)
-            segments = await self._identify_speakers(segments)
+            segments = await self._identify_speakers(
+                segments, video_path=session.audio_file_path
+            )
             await self._store_transcript(session_id, segments)
             await self._update_status(session, "processing", "speaker_identification", 28)
 
@@ -84,6 +96,10 @@ class PipelineOrchestrator:
                 # Store verdict
                 await self._store_verdict(claim, verdict, evidence)
 
+            # Stage 4: Generate AI summary
+            await self._update_status(session, "processing", "summarization", 95)
+            await self._generate_summary(session, segments)
+
             # Done
             session.status = "completed"
             session.processing_stage = None
@@ -118,75 +134,38 @@ class PipelineOrchestrator:
             self.db.add(ts)
         await self.db.commit()
 
-    async def _identify_speakers(self, segments: list[dict]) -> list[dict]:
-        """Identify speakers by web-searching each speaker's quotes individually."""
+    async def _generate_summary(self, session: Session, segments: list[dict]) -> None:
+        """Generate an AI title and summary from the transcript."""
         if not segments:
-            return segments
+            return
 
-        unique_speakers = set(seg.get("speaker_label", "") for seg in segments)
+        transcript_lines = []
+        for seg in segments:
+            speaker = seg.get("speaker_label", "Speaker")
+            text = seg.get("text", "")
+            transcript_lines.append(f"{speaker}: {text}")
 
-        # For each unique speaker, collect their most distinctive quotes
-        speaker_quotes: dict[str, list[str]] = {}
-        for speaker_label in unique_speakers:
-            speaker_segs = [s for s in segments if s.get("speaker_label") == speaker_label]
-            # Sort by length descending — longer utterances are more searchable
-            speaker_segs.sort(key=lambda s: len(s["text"]), reverse=True)
-            quotes = []
-            for seg in speaker_segs[:3]:
-                text = seg["text"].strip()
-                if len(text) > 30:
-                    quotes.append(text[:200])
-            if quotes:
-                speaker_quotes[speaker_label] = quotes
+        transcript_text = "\n".join(transcript_lines)[:4000]
 
-        if not speaker_quotes:
-            return segments
+        prompt = f"""Analyze this transcript from a political broadcast and generate:
+1. A concise, descriptive title (max 80 characters) - like a news headline
+2. A 2-3 sentence summary covering the key topics, speakers, and claims discussed
 
-        # Also build context: what does each speaker say and who do they address?
-        context_lines = []
-        for seg in segments[:30]:
-            context_lines.append(f'{seg.get("speaker_label", "?")}: {seg["text"][:100]}')
-        context_block = "\n".join(context_lines)
+Transcript:
+{transcript_text}
 
-        # Search each speaker's quotes individually to find specific attribution
-        speaker_map: dict[str, dict] = {}
-        for label, quotes in speaker_quotes.items():
-            quote_block = "\n".join(f'  - "{q}"' for q in quotes)
+Respond ONLY with a JSON object:
+{{"title": "Your Title Here", "summary": "Your summary here."}}"""
 
-            prompt = f"""I need to identify ONE specific speaker from a political broadcast. This speaker is labeled "{label}" in the transcript.
-
-Here are quotes ONLY from {label}:
-{quote_block}
-
-Here is broader transcript context showing the conversation:
-{context_block[:2000]}
-
-Search the web for the quotes above. Find news articles or transcripts that attribute these SPECIFIC words to a SPECIFIC person. Pay close attention to:
-- Who is QUOTED as saying these exact words (not just mentioned in the same article)
-- If {label} says "I ask you, Attorney General Bondi" — then {label} is NOT Bondi, they are questioning Bondi
-- If {label} is answering questions and defending positions, they are likely the witness/official being questioned
-
-Respond ONLY with a JSON object for this one speaker:
-{{"name": "Full Name with Title", "party": "D or R or null"}}"""
-
+        for attempt in range(3):
             try:
-                response = await self.anthropic_client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=512,
-                    tools=[{
-                        "type": "web_search_20250305",
-                        "name": "web_search",
-                        "max_uses": 2,
-                    }],
+                response = await self.groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    max_tokens=300,
                     messages=[{"role": "user", "content": prompt}],
                 )
 
-                result_text = ""
-                for block in response.content:
-                    if block.type == "text":
-                        result_text += block.text
-
-                result_text = result_text.strip()
+                result_text = (response.choices[0].message.content or "").strip()
                 if result_text.startswith("```"):
                     result_text = result_text.split("\n", 1)[1]
                 if result_text.endswith("```"):
@@ -196,12 +175,840 @@ Respond ONLY with a JSON object for this one speaker:
                 json_start = result_text.find("{")
                 json_end = result_text.rfind("}") + 1
                 if json_start >= 0 and json_end > json_start:
-                    info = json.loads(result_text[json_start:json_end])
-                    speaker_map[label] = info
-                    log.info("speaker_identified", label=label, info=info)
+                    result = json.loads(result_text[json_start:json_end])
+
+                    generated_title = result.get("title", "")
+                    generated_summary = result.get("summary", "")
+
+                    if generated_title and (
+                        not session.title or session.title == session.source_url
+                    ):
+                        session.title = generated_title
+
+                    if generated_summary and not session.description:
+                        session.description = generated_summary
+
+                    log.info(
+                        "ai_summary_generated",
+                        session_id=session.id,
+                        title=generated_title[:50],
+                    )
+                break
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str and attempt < 2:
+                    import re as _re
+
+                    wait_match = _re.search(r"try again in (\d+\.?\d*)s", error_str)
+                    wait_secs = float(wait_match.group(1)) if wait_match else 5.0
+                    log.info("summary_rate_limited", attempt=attempt, wait=wait_secs)
+                    await asyncio.sleep(wait_secs + 1)
+                else:
+                    log.warning("ai_summary_failed", session_id=session.id, error=error_str)
+                    break
+
+    def _extract_speaker_clues(self, segments: list) -> dict[str, str]:
+        """Scan transcript for title-and-name mentions that can identify speakers."""
+        import re
+
+        title_pattern = re.compile(
+            r"\b(Senator|Representative|Congressman|Congresswoman|Secretary|"
+            r"Attorney General|General|Governor|Mayor|President|Vice President|"
+            r"Chairman|Chairwoman|Director|Ambassador|Justice|Judge|Dr\.|Professor)\s+"
+            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"
+        )
+
+        # Patterns that indicate the speaker is referring to THEMSELVES
+        self_ref_pattern = re.compile(
+            r"\b(I am|I'm|my name is|I serve as|I was|speaking as)\b",
+            re.IGNORECASE,
+        )
+
+        # Patterns that indicate the speaker is ADDRESSING someone else
+        address_pattern = re.compile(
+            r"\b(thank you|I ask you|you said|do you|would you|can you|Mr\.|Ms\.|Mrs\.)\b",
+            re.IGNORECASE,
+        )
+
+        # Collect mentions: for each segment, record
+        # (speaker_label, mentioned_name, is_likely_addressing_other)
+        mentions: list[tuple[str, str, bool]] = []
+
+        for seg in segments:
+            speaker = seg.get("speaker_label") or seg.get("speaker", "")
+            text = seg.get("text", "")
+            if not speaker or not text:
+                continue
+
+            matches = title_pattern.findall(text)
+            for title, name in matches:
+                full_name = f"{title} {name}"
+                # Check context around the mention
+                has_self_ref = bool(self_ref_pattern.search(text))
+                has_address = bool(address_pattern.search(text))
+
+                if has_self_ref and not has_address:
+                    # Speaker is likely referring to themselves
+                    mentions.append((speaker, full_name, False))
+                elif has_address and not has_self_ref:
+                    # Speaker is likely addressing someone else
+                    mentions.append((speaker, full_name, True))
+                else:
+                    # Ambiguous — don't use as a definitive clue
+                    mentions.append((speaker, full_name, True))
+
+        identified: dict[str, str] = {}
+        for speaker, name, is_addressing_other in mentions:
+            if not is_addressing_other:
+                # Self-reference: the speaker IS this person
+                if speaker not in identified:
+                    identified[speaker] = name
+            # Don't try to assign names to other speakers via heuristic —
+            # let the LLM handle that with the clue as context
+
+        return identified
+
+    def _collect_all_name_mentions(self, segments: list) -> list[str]:
+        """Collect all title+name mentions from the transcript for LLM context."""
+        import re
+
+        title_pattern = re.compile(
+            r"\b(Senator|Representative|Congressman|Congresswoman|Secretary|"
+            r"Attorney General|General|Governor|Mayor|President|Vice President|"
+            r"Chairman|Chairwoman|Director|Ambassador|Justice|Judge|Dr\.|Professor)\s+"
+            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"
+        )
+
+        names = set()
+        for seg in segments:
+            text = seg.get("text", "")
+            for title, name in title_pattern.findall(text):
+                names.add(f"{title} {name}")
+        return sorted(names)
+
+    @staticmethod
+    def _extract_onscreen_text(video_path: str) -> list[str]:
+        """Extract on-screen text from video frames using ffmpeg + Tesseract OCR.
+
+        Captures frames at regular intervals and runs OCR to find
+        lower-third graphics, chyrons, and name cards.
+        """
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if not video_path:
+            return []
+
+        video_exts = {".mp4", ".webm", ".mov", ".mkv"}
+        ext = os.path.splitext(video_path)[1].lower()
+        if ext not in video_exts:
+            return []
+
+        texts = []
+        tmpdir = tempfile.mkdtemp(prefix="pf_ocr_")
+
+        try:
+            # Sample several early timestamps to catch lower thirds and chyrons.
+            timestamps = ["0", "5", "15", "30", "60", "120"]
+            for i, ts in enumerate(timestamps):
+                frame_path = os.path.join(tmpdir, f"frame_{i}.png")
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-ss",
+                            ts,
+                            "-i",
+                            video_path,
+                            "-frames:v",
+                            "1",
+                            "-vf",
+                            "crop=iw:ih/3:0:2*ih/3",
+                            "-y",
+                            frame_path,
+                        ],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if not os.path.exists(frame_path):
+                        continue
+
+                    result = subprocess.run(
+                        ["tesseract", frame_path, "-", "--psm", "6"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        text = result.stdout.strip()
+                        for line in text.split("\n"):
+                            line = line.strip()
+                            if len(line) > 5 and sum(
+                                c.isalpha() or c.isspace() for c in line
+                            ) > len(line) * 0.6:
+                                texts.append(line)
+                except Exception:
+                    continue
+        except Exception as e:
+            log.warning("ocr_extraction_failed", error=str(e))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        seen = set()
+        unique = []
+        for text in texts:
+            normalized = text.lower().strip()
+            if normalized not in seen:
+                seen.add(normalized)
+                unique.append(text)
+
+        return unique
+
+    async def _identify_faces_from_video(self, video_path: str) -> list[str]:
+        """Extract frames from video and use Claude Vision to identify public figures.
+
+        Returns a list of identified person descriptions like:
+        ["Kash Patel, FBI Director", "Senator Cory Booker"]
+        """
+        import base64
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if not video_path:
+            return []
+
+        video_exts = {".mp4", ".webm", ".mov", ".mkv"}
+        ext = os.path.splitext(video_path)[1].lower()
+        if ext not in video_exts:
+            return []
+
+        tmpdir = tempfile.mkdtemp(prefix="pf_face_")
+        identified_people: list[str] = []
+
+        try:
+            # Extract frames at different timestamps to catch different speakers.
+            timestamps = ["3", "10", "30", "60", "90", "120"]
+            frame_paths = []
+
+            for i, ts in enumerate(timestamps):
+                frame_path = os.path.join(tmpdir, f"frame_{i}.jpg")
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-ss",
+                            ts,
+                            "-i",
+                            video_path,
+                            "-frames:v",
+                            "1",
+                            "-q:v",
+                            "2",
+                            "-y",
+                            frame_path,
+                        ],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if os.path.exists(frame_path) and os.path.getsize(frame_path) > 1000:
+                        frame_paths.append(frame_path)
+                except Exception:
+                    continue
+
+            if not frame_paths:
+                return []
+
+            # Use up to 4 frames to keep costs reasonable.
+            frames_to_send = frame_paths[:4]
+
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+            content: list[dict] = []
+            for frame_path in frames_to_send:
+                with open(frame_path, "rb") as frame_file:
+                    image_data = base64.b64encode(frame_file.read()).decode("utf-8")
+                content.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_data,
+                        },
+                    }
+                )
+
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "These frames are from a political broadcast "
+                        "(congressional hearing, news interview, etc). "
+                        "Identify ALL people visible in these frames. "
+                        "For each person, provide their full name and title/role. "
+                        "Focus on the main speakers — the people at microphones, "
+                        "at the witness table, or behind nameplates.\n\n"
+                        "Look for clues: nameplates, lower-third graphics, chyrons, "
+                        "seating positions. The person at the witness table facing "
+                        "the committee is typically the person testifying. "
+                        "People on the raised dais/platform are typically senators "
+                        "or committee members.\n\n"
+                        "Respond ONLY with a JSON array of strings, each being a "
+                        "person's identity:\n"
+                        '["Kash Patel, FBI Director", "Senator Cory Booker"]'
+                    ),
+                }
+            )
+
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                messages=[{"role": "user", "content": content}],
+            )
+
+            result_text = response.content[0].text.strip()
+            if result_text.startswith("```"):
+                result_text = result_text.split("\n", 1)[1]
+            if result_text.endswith("```"):
+                result_text = result_text.rsplit("```", 1)[0]
+            result_text = result_text.strip()
+
+            json_start = result_text.find("[")
+            json_end = result_text.rfind("]") + 1
+            if json_start >= 0 and json_end > json_start:
+                people = json.loads(result_text[json_start:json_end])
+                if isinstance(people, list):
+                    identified_people = [str(person) for person in people if person]
+                    log.info("face_id_results", people=identified_people)
+
+        except Exception as e:
+            log.warning("face_id_failed", error=str(e))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        return identified_people
+
+    @staticmethod
+    def _split_qa_segments(segments: list[dict]) -> list[dict]:
+        """Split segments that contain both Q&A dialogue from different speakers.
+
+        In hearings, Deepgram sometimes lumps a question and its answer into one segment.
+        Detect this by finding sentences that end with '?' followed by a statement
+        that sounds like an answer.
+        """
+        import re
+
+        result = []
+        for seg in segments:
+            text = seg.get("text", "").strip()
+            if not text:
+                result.append(seg)
+                continue
+
+            # Look for question mark followed by what looks like an answer
+            # Pattern: "...question? Answer statement..."
+            qa_split = re.split(r"(\?\s+)", text)
+
+            if len(qa_split) < 3:
+                # No Q&A pattern found
+                result.append(seg)
+                continue
+
+            # Reconstruct: question part includes everything up to and including the ?
+            # Answer part is everything after
+            question_parts = []
+            answer_start_idx = None
+
+            for i, part in enumerate(qa_split):
+                if part.strip() == "?":
+                    # This is a question mark separator
+                    question_parts.append(part)
+                    # Check if what follows looks like an answer (not another question)
+                    remaining = "".join(qa_split[i + 1 :]).strip()
+                    if remaining and not remaining.endswith("?"):
+                        answer_start_idx = i + 1
+                        break
+                else:
+                    question_parts.append(part)
+
+            if answer_start_idx is None:
+                result.append(seg)
+                continue
+
+            question_text = "".join(question_parts).strip()
+            answer_text = "".join(qa_split[answer_start_idx:]).strip()
+
+            if not question_text or not answer_text:
+                result.append(seg)
+                continue
+
+            # Estimate split point in time based on text length ratio
+            total_len = len(text)
+            q_ratio = len(question_text) / total_len
+            duration = seg["end_ms"] - seg["start_ms"]
+            split_ms = seg["start_ms"] + int(duration * q_ratio)
+
+            # Create two segments
+            q_seg = dict(seg)
+            q_seg["text"] = question_text
+            q_seg["end_ms"] = split_ms
+
+            a_seg = dict(seg)
+            a_seg["text"] = answer_text
+            a_seg["start_ms"] = split_ms
+            original_label = seg.get("speaker_label", "Speaker")
+            other_speakers = [
+                s.get("speaker_label", "")
+                for s in segments
+                if s.get("speaker_label", "") != original_label
+            ]
+            if other_speakers:
+                from collections import Counter
+
+                most_common_other = Counter(other_speakers).most_common(1)[0][0]
+                a_seg["speaker_label"] = most_common_other
+            else:
+                a_seg["speaker_label"] = (
+                    f"Speaker {original_label.split()[-1]}B"
+                    if " " in original_label
+                    else "Respondent"
+                )
+
+            result.append(q_seg)
+            result.append(a_seg)
+
+        return result
+
+    async def _llm_rediarize(self, segments: list[dict]) -> list[dict]:
+        """Use LLM to fix speaker diarization when Deepgram merges multiple speakers.
+
+        Deepgram sometimes assigns most segments to one speaker in broadcast audio.
+        This method sends the transcript to the LLM to re-assign speaker labels
+        based on conversational context.
+        """
+        if not segments or len(segments) < 3:
+            return segments
+
+        from collections import Counter
+
+        speaker_counts = Counter(seg.get("speaker_label", "") for seg in segments)
+        total = sum(speaker_counts.values())
+        max_speaker, max_count = speaker_counts.most_common(1)[0]
+
+        if max_count / total < 0.7:
+            return segments
+
+        log.info(
+            "diarization_suspicious",
+            dominant_speaker=max_speaker,
+            ratio=max_count / total,
+        )
+
+        transcript_lines = []
+        for i, seg in enumerate(segments):
+            text_preview = seg.get("text", "")[:150]
+            start_s = seg["start_ms"] / 1000
+            transcript_lines.append(
+                f"[{i}] ({start_s:.1f}s) {seg.get('speaker_label', '?')}: {text_preview}"
+            )
+
+        transcript_block = "\n".join(transcript_lines[:50])
+
+        prompt = f"""This is a transcript from a political broadcast (likely a congressional hearing or interview). The automatic speaker diarization was poor - it assigned most segments to one speaker, but there are clearly multiple speakers taking turns.
+
+Your job: re-assign speaker labels to each segment. In a hearing, there's typically:
+- A QUESTIONER (senator/representative) who asks questions
+- A WITNESS (official/appointee) who answers
+
+Key signals:
+- Questions end with "?" - the person asking is the questioner
+- Short responses like "Yes sir", "That's correct", "Absolutely" - these are the witness answering
+- Defensive statements like "The premise is false", "I can tell you that..." - this is the witness
+- Accusations, rhetorical questions, citing statistics - this is the questioner
+- "Thank you, Senator/Chairman" - this is the witness addressing the questioner
+
+Here is the transcript with segment indices:
+{transcript_block}
+
+Re-assign each segment to either "A" (questioner) or "B" (witness/answerer).
+
+CRITICAL: When a single segment contains BOTH a question AND an answer (e.g., "Have you done X? Yes, we have done X because..."), split it:
+- Assign the question portion to A and the answer portion to B
+- In your response, indicate the split point
+
+Respond with a JSON array where each element is either:
+- {{"idx": 0, "speaker": "A"}} for a whole segment
+- {{"idx": 0, "speaker": "A", "split_at": "Yes, we have", "second_speaker": "B"}} for segments that need splitting
+
+Return ONLY the JSON array, no other text."""
+
+        for attempt in range(3):
+            try:
+                response = await self.groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+
+                result_text = (response.choices[0].message.content or "").strip()
+                if result_text.startswith("```"):
+                    result_text = result_text.split("\n", 1)[1]
+                if result_text.endswith("```"):
+                    result_text = result_text.rsplit("```", 1)[0]
+                result_text = result_text.strip()
+
+                json_start = result_text.find("[")
+                json_end = result_text.rfind("]") + 1
+                if json_start < 0 or json_end <= json_start:
+                    log.warning("rediarize_parse_failed", text=result_text[:200])
+                    return segments
+
+                assignments = json.loads(result_text[json_start:json_end])
+                if not isinstance(assignments, list):
+                    log.warning("rediarize_parse_failed", text=result_text[:200])
+                    return segments
+
+                new_segments = []
+                assignment_map = {}
+                for assignment in assignments:
+                    if isinstance(assignment, dict) and "idx" in assignment:
+                        assignment_map[assignment["idx"]] = assignment
+
+                for i, seg in enumerate(segments):
+                    if i >= 50:
+                        new_segments.append(seg)
+                        continue
+
+                    assignment = assignment_map.get(i)
+                    if not assignment:
+                        new_segments.append(seg)
+                        continue
+
+                    speaker_label = (
+                        "Speaker_Q" if assignment.get("speaker") == "A" else "Speaker_W"
+                    )
+
+                    if "split_at" in assignment and assignment.get("second_speaker"):
+                        split_text = assignment["split_at"]
+                        full_text = seg.get("text", "")
+                        split_idx = full_text.find(split_text)
+
+                        if split_idx > 0:
+                            part1_text = full_text[:split_idx].strip()
+                            part2_text = full_text[split_idx:].strip()
+                            split_end_ms = seg["start_ms"]
+
+                            if part1_text:
+                                seg1 = dict(seg)
+                                seg1["speaker_label"] = speaker_label
+                                seg1["text"] = part1_text
+                                duration = seg["end_ms"] - seg["start_ms"]
+                                ratio = len(part1_text) / max(len(full_text), 1)
+                                split_end_ms = seg["start_ms"] + int(duration * ratio)
+                                seg1["end_ms"] = split_end_ms
+                                new_segments.append(seg1)
+
+                            if part2_text:
+                                seg2 = dict(seg)
+                                second_label = (
+                                    "Speaker_Q"
+                                    if assignment["second_speaker"] == "A"
+                                    else "Speaker_W"
+                                )
+                                seg2["speaker_label"] = second_label
+                                seg2["text"] = part2_text
+                                seg2["start_ms"] = split_end_ms if part1_text else seg["start_ms"]
+                                new_segments.append(seg2)
+                        else:
+                            seg_copy = dict(seg)
+                            seg_copy["speaker_label"] = speaker_label
+                            new_segments.append(seg_copy)
+                    else:
+                        seg_copy = dict(seg)
+                        seg_copy["speaker_label"] = speaker_label
+                        new_segments.append(seg_copy)
+
+                log.info("rediarization_complete", original=len(segments), new=len(new_segments))
+                return new_segments
 
             except Exception as e:
-                log.warning("speaker_id_search_error", label=label, error=str(e))
+                error_str = str(e)
+                if "429" in error_str and attempt < 2:
+                    import re as _re
+
+                    wait_match = _re.search(r"try again in (\d+\.?\d*)s", error_str)
+                    wait_secs = float(wait_match.group(1)) if wait_match else 5.0
+                    log.info("rediarize_rate_limited", attempt=attempt, wait=wait_secs)
+                    await asyncio.sleep(wait_secs + 1)
+                else:
+                    log.warning("rediarize_failed", error=error_str)
+                    return segments
+
+        return segments
+
+    async def _identify_speakers(
+        self, segments: list[dict], video_path: str | None = None
+    ) -> list[dict]:
+        """Identify speakers from transcript context and public-figure knowledge."""
+        if not segments:
+            return segments
+
+        merged_segments = self._merge_adjacent_segments(segments)
+        unique_speakers = set(seg.get("speaker_label", "") for seg in merged_segments)
+        clues = self._extract_speaker_clues(merged_segments)
+        all_names_mentioned = self._collect_all_name_mentions(merged_segments)
+        onscreen_texts = []
+        if video_path:
+            onscreen_texts = self._extract_onscreen_text(video_path)
+            if onscreen_texts:
+                log.info("ocr_texts_found", count=len(onscreen_texts), texts=onscreen_texts[:5])
+
+        face_ids: list[str] = []
+        if video_path:
+            face_ids = await self._identify_faces_from_video(video_path)
+
+        # For each unique speaker, collect their most distinctive quotes
+        speaker_quotes: dict[str, list[str]] = {}
+        for speaker_label in unique_speakers:
+            speaker_segs = [s for s in merged_segments if s.get("speaker_label") == speaker_label]
+            # Sort by length descending so the model sees the most informative utterances.
+            speaker_segs.sort(key=lambda s: len(s["text"]), reverse=True)
+            quotes = []
+            for seg in speaker_segs[:3]:
+                text = seg["text"].strip()
+                if len(text) > 30:
+                    quotes.append(text[:200])
+            if quotes:
+                speaker_quotes[speaker_label] = quotes
+
+        speaker_map: dict[str, dict] = {}
+        # Clues from self-references are high confidence — use directly
+        for label, clue_name in clues.items():
+            speaker_map[label] = {"name": clue_name, "party": None}
+        for label, clue_name in clues.items():
+            log.info("speaker_identified_from_clue", label=label, clue=clue_name)
+
+        if not speaker_quotes and not speaker_map:
+            return segments
+
+        # Also build context: what does each speaker say and who do they address?
+        context_lines = []
+        for seg in merged_segments[:30]:
+            context_lines.append(f'{seg.get("speaker_label", "?")}: {seg["text"][:100]}')
+        context_block = "\n".join(context_lines)
+
+        # Identify ALL unidentified speakers in a single LLM call
+        unidentified = {label: quotes for label, quotes in speaker_quotes.items() if label not in speaker_map}
+
+        if unidentified:
+            # Build a per-speaker section showing their quotes
+            speaker_sections = []
+            for label, quotes in unidentified.items():
+                quote_block = "\n".join(f'    - "{q}"' for q in quotes)
+                clue_note = ""
+                if label in clues:
+                    clue_note = f"\n    Note: This speaker was addressed as '{clues[label]}' by another speaker."
+                speaker_sections.append(f"  {label}:\n{quote_block}{clue_note}")
+
+            all_speakers_block = "\n\n".join(speaker_sections)
+
+            names_text = ""
+            if all_names_mentioned:
+                names_text = (
+                    f"\nNames/titles mentioned in the transcript: {', '.join(all_names_mentioned)}"
+                )
+
+            ocr_text = ""
+            if onscreen_texts:
+                ocr_text = (
+                    "\n\nIMPORTANT — On-screen text extracted from the video "
+                    "(chyrons, lower-third graphics, name cards):\n"
+                    + "\n".join(f'  - "{t}"' for t in onscreen_texts[:10])
+                    + "\nThese on-screen graphics are HIGH CONFIDENCE identifiers. "
+                    "If a name appears on screen, USE IT."
+                )
+
+            face_id_text = ""
+            if face_ids:
+                face_id_text = (
+                    "\n\nPeople VISUALLY IDENTIFIED from video frames (face recognition):\n"
+                    + "\n".join(f"  - {person}" for person in face_ids)
+                    + "\nThese are HIGH CONFIDENCE visual identifications. Match speakers to these people."
+                )
+
+            from datetime import date
+
+            today = date.today().isoformat()
+
+            prompt = f"""Identify ALL speakers in this political broadcast transcript. Today's date is {today} — use CURRENT officeholders only.
+
+Here is the transcript (each line prefixed with the speaker label):
+{context_block[:3000]}
+
+Here are distinctive quotes from each speaker:
+
+{all_speakers_block}
+{names_text}{ocr_text}{face_id_text}
+
+CRITICAL INSTRUCTIONS for identification:
+- The speaker who ASKS QUESTIONS is typically a senator, representative, or committee member
+- The speaker who ANSWERS questions and DEFENDS positions/actions) is typically the witness, official, or appointee being questioned
+- If on-screen text says "X TESTIFIES AT Y HEARING", then X is the person ANSWERING questions, not asking them
+- Do NOT swap the questioner and the witness — pay attention to who asks vs who answers
+- If someone says "I ask you..." or "Do you..." — THEY are the questioner, not the person being addressed
+- If someone says "Yes sir", "That's correct", "The premise is false" — THEY are the witness answering
+
+Respond with a JSON object mapping each speaker label to their identity:
+{{
+  "Speaker 0": {{"name": "Full Name with Title", "party": "D or R or null"}},
+  "Speaker 1": {{"name": "Full Name with Title", "party": "D or R or null"}}
+}}
+
+Include ALL speaker labels from the transcript. Use null for party if unknown or not applicable."""
+
+            import time as _time
+
+            for attempt in range(3):
+                try:
+                    response = await self.groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        max_tokens=1024,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+
+                    result_text = (response.choices[0].message.content or "").strip()
+                    if result_text.startswith("```"):
+                        result_text = result_text.split("\n", 1)[1]
+                    if result_text.endswith("```"):
+                        result_text = result_text.rsplit("```", 1)[0]
+                    result_text = result_text.strip()
+
+                    json_start = result_text.find("{")
+                    json_end = result_text.rfind("}") + 1
+                    if json_start >= 0 and json_end > json_start:
+                        all_ids = json.loads(result_text[json_start:json_end])
+                        for label, info in all_ids.items():
+                            if label not in speaker_map and isinstance(info, dict):
+                                speaker_map[label] = info
+                                log.info("speaker_identified", label=label, info=info)
+                    break
+
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str and attempt < 2:
+                        # Rate limited — wait and retry
+                        import re as _re
+
+                        wait_match = _re.search(r"try again in (\d+\.?\d*)s", error_str)
+                        wait_secs = float(wait_match.group(1)) if wait_match else 5.0
+                        log.info("speaker_id_rate_limited", attempt=attempt, wait=wait_secs)
+                        await asyncio.sleep(wait_secs + 1)
+                    else:
+                        log.warning("speaker_id_error", error=error_str)
+                        break
+
+        # Fallback: use OCR text to identify speakers when LLM failed
+        if onscreen_texts:
+            import re as _re
+
+            # Look for patterns like "DIRECTOR PATEL TESTIFIES" or "SEN. BOOKER"
+            ocr_combined = " ".join(onscreen_texts).upper()
+
+            # Extract names from OCR: look for "TITLE NAME" patterns
+            ocr_name_pattern = _re.compile(
+                r"(?:DIRECTOR|SENATOR|SEN\.|REP\.|REPRESENTATIVE|SECRETARY|"
+                r"ATTORNEY GENERAL|GOVERNOR|CHAIRMAN|CHAIRWOMAN|JUDGE|JUSTICE)\s+"
+                r"([A-Z][A-Z]+(?:\s+[A-Z][A-Z]+)?)",
+                _re.IGNORECASE,
+            )
+            ocr_names = []
+            for match in ocr_name_pattern.finditer(ocr_combined):
+                full_match = match.group(0).strip()
+                ocr_names.append(full_match)
+
+            # Also look for "X TESTIFIES" pattern — the person testifying is the witness
+            testifies_pattern = _re.compile(
+                r"(?:DIRECTOR|SECRETARY|ATTORNEY GENERAL|CHAIRMAN|CHAIRWOMAN)\s+"
+                r"([A-Z][A-Z]+)\s+TESTIF",
+                _re.IGNORECASE,
+            )
+            witness_name = None
+            for match in testifies_pattern.finditer(ocr_combined):
+                witness_name = match.group(0).split("TESTIF")[0].strip()
+                break
+
+            if witness_name or ocr_names:
+                log.info("ocr_fallback_names", witness=witness_name, names=ocr_names)
+
+            # If we have a witness and unidentified speakers, assign the witness
+            # to the speaker who ANSWERS questions (shorter segments, responds to questions)
+            if witness_name:
+                for label in list(unique_speakers):
+                    if label in speaker_map:
+                        continue
+                    # Check if this speaker is the witness (answers questions, defends positions)
+                    speaker_segs = [
+                        s for s in merged_segments if s.get("speaker_label") == label
+                    ]
+                    answers_questions = any(
+                        seg["text"].strip().startswith(
+                            (
+                                "The premise",
+                                "Yes",
+                                "No,",
+                                "That's",
+                                "Absolutely",
+                                "I ",
+                                "We ",
+                            )
+                        )
+                        for seg in speaker_segs
+                    )
+                    asks_questions = any("?" in seg["text"] for seg in speaker_segs)
+                    question_ratio = sum(
+                        1 for seg in speaker_segs if "?" in seg["text"]
+                    ) / max(len(speaker_segs), 1)
+
+                    # The witness answers more than they ask
+                    if question_ratio < 0.3 and answers_questions:
+                        speaker_map[label] = {"name": witness_name.title(), "party": None}
+                        log.info(
+                            "speaker_assigned_from_ocr_witness",
+                            label=label,
+                            name=witness_name,
+                            asks_questions=asks_questions,
+                        )
+                        break
+
+            # For remaining unidentified speakers, if OCR found senator names, assign them
+            # to the speaker who asks the most questions
+            senator_names = [
+                n for n in ocr_names if any(t in n.upper() for t in ["SENATOR", "SEN."])
+            ]
+            if senator_names:
+                for label in list(unique_speakers):
+                    if label in speaker_map:
+                        continue
+                    speaker_segs = [
+                        s for s in merged_segments if s.get("speaker_label") == label
+                    ]
+                    question_ratio = sum(
+                        1 for seg in speaker_segs if "?" in seg["text"]
+                    ) / max(len(speaker_segs), 1)
+                    if question_ratio > 0.3:
+                        speaker_map[label] = {"name": senator_names[0].title(), "party": None}
+                        log.info(
+                            "speaker_assigned_from_ocr_senator",
+                            label=label,
+                            name=senator_names[0],
+                        )
+                        break
 
         # Apply the mapping to all segments
         for seg in segments:
@@ -213,6 +1020,12 @@ Respond ONLY with a JSON object for this one speaker:
                     seg["speaker_party"] = info.get("party")
                 elif isinstance(info, str):
                     seg["speaker_label"] = info
+
+        for seg in segments:
+            label = seg.get("speaker_label", "")
+            if "_response" in label:
+                base_label = label.replace("_response", "")
+                seg["speaker_label"] = "Respondent"
 
         log.info("speakers_identified_all", mapping=speaker_map)
         return segments
@@ -231,13 +1044,72 @@ Respond ONLY with a JSON object for this one speaker:
 
         transcript_for_llm = "\n".join(numbered_lines)
 
+        chunk_size = 3500
+        overlap_line_count = 3
+        transcript_chunks = []
+        current_chunk_lines = []
+        current_chunk_start = 0
+        current_chunk_length = 0
+
+        for i, line in enumerate(numbered_lines):
+            next_length = current_chunk_length + len(line) + (1 if current_chunk_lines else 0)
+            if current_chunk_lines and next_length > chunk_size:
+                transcript_chunks.append(
+                    {"start_offset": current_chunk_start, "lines": current_chunk_lines}
+                )
+                current_chunk_lines = [line]
+                current_chunk_start = i
+                current_chunk_length = len(line)
+                continue
+
+            if not current_chunk_lines:
+                current_chunk_start = i
+                current_chunk_length = len(line)
+            else:
+                current_chunk_length = next_length
+            current_chunk_lines.append(line)
+
+        if current_chunk_lines:
+            transcript_chunks.append(
+                {"start_offset": current_chunk_start, "lines": current_chunk_lines}
+            )
+
         # Use Claude to identify checkable claims in batch
-        prompt = f"""You are a claim detector for a political fact-checking tool. Analyze this transcript and identify ALL statements that contain checkable factual claims.
+        detected = []
+        successful_chunks = 0
+        for chunk_idx, chunk in enumerate(transcript_chunks):
+            chunk_lines = []
+            for local_idx, line in enumerate(chunk["lines"]):
+                _, _, line_text = line.partition("] ")
+                chunk_lines.append(f"[{local_idx}] {line_text or line}")
+
+            chunk_text_parts = []
+            if chunk_idx > 0:
+                previous_lines = transcript_chunks[chunk_idx - 1]["lines"][-overlap_line_count:]
+                if previous_lines:
+                    chunk_text_parts.append(
+                        "OVERLAP CONTEXT FROM PREVIOUS CHUNK. DO NOT RETURN CLAIMS FROM THESE LINES:"
+                    )
+                    for overlap_line in previous_lines:
+                        _, _, overlap_text = overlap_line.partition("] ")
+                        chunk_text_parts.append(f"(overlap) {overlap_text or overlap_line}")
+                    chunk_text_parts.append("CURRENT CHUNK:")
+
+            chunk_text_parts.append("\n".join(chunk_lines))
+            chunk_text = "\n".join(chunk_text_parts)
+
+            prompt = f"""You are a claim detector for a political fact-checking tool. Analyze this transcript and identify only the most relevant statements that contain checkable factual claims.
 
 A checkable claim is a statement that:
 - Asserts something specific happened or is true
 - Can be verified with evidence (government data, news reports, court records, etc.)
 - Names specific people, events, numbers, dates, or actions
+
+IMPORTANT FILTERING RULES:
+- Only flag claims that a voter, journalist, or fact-checker would consider important, misleading, or worth verifying.
+- DO NOT flag: routine self-introductions ('I serve on the Armed Services Committee'), uncontested procedural facts, greetings, opinions clearly stated as opinions ('I believe we should...'), or trivial biographical details.
+- DO flag: statistics and numbers, policy impact claims, accusations against people or organizations, promises about future actions, claims about disputed events, comparisons or rankings, claims that could mislead voters.
+- When in doubt, skip the claim rather than including it.
 
 Do NOT flag:
 - Questions or requests for information
@@ -256,29 +1128,101 @@ Respond ONLY with a JSON array. Each element should have:
 Example: [{{"line_index": 3, "claim_text": "The unemployment rate dropped to 3.5 percent last month", "claim_type": "checkable_fact"}}]
 
 Transcript:
-{transcript_for_llm[:4000]}"""
+{chunk_text}"""
 
-        try:
-            response = await self.anthropic_client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=2000,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            try:
+                response = await self.groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    max_tokens=4000,
+                    messages=[{"role": "user", "content": prompt}],
+                )
 
-            text = response.content[0].text.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1]
-            if text.endswith("```"):
-                text = text.rsplit("```", 1)[0]
-            text = text.strip()
+                text = (response.choices[0].message.content or "").strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[1]
+                if text.endswith("```"):
+                    text = text.rsplit("```", 1)[0]
+                text = text.strip()
 
-            detected = json.loads(text)
-            log.info("llm_claims_detected", count=len(detected))
+                chunk_detected = json.loads(text)
+                successful_chunks += 1
+                if chunk["start_offset"]:
+                    for item in chunk_detected:
+                        item["line_index"] = item.get("line_index", 0) + chunk["start_offset"]
 
-        except Exception as e:
-            log.warning("llm_claim_detection_error", error=str(e))
-            # Fall back to heuristic detection
+                detected.extend(chunk_detected)
+                log.info(
+                    "llm_claims_detected_chunk",
+                    chunk_index=chunk_idx,
+                    count=len(chunk_detected),
+                )
+
+            except Exception as e:
+                log.warning(
+                    "llm_claim_detection_error",
+                    chunk_index=chunk_idx,
+                    error=str(e),
+                )
+                continue
+
+        if successful_chunks == 0:
+            # Fall back to heuristic detection if every chunk failed
             return await self._detect_claims_heuristic(session_id, segments)
+
+        log.info("llm_claims_detected", count=len(detected), chunks=successful_chunks)
+
+        def claim_text_jaccard(left: str, right: str) -> float:
+            left_words = set(left.lower().split())
+            right_words = set(right.lower().split())
+            union = left_words | right_words
+            if not union:
+                return 0.0
+            return len(left_words & right_words) / len(union)
+
+        deduplicated = []
+        removed_duplicates = 0
+        for item in detected:
+            claim_text = item.get("claim_text", "").strip()
+            if not claim_text:
+                deduplicated.append(item)
+                continue
+
+            matched_idx = None
+            for idx, kept_item in enumerate(deduplicated):
+                kept_claim_text = kept_item.get("claim_text", "").strip()
+                if (
+                    kept_claim_text
+                    and claim_text_jaccard(claim_text, kept_claim_text) > 0.8
+                ):
+                    matched_idx = idx
+                    break
+
+            if matched_idx is None:
+                deduplicated.append(item)
+                continue
+
+            removed_duplicates += 1
+            kept_item = deduplicated[matched_idx]
+            kept_claim_text = kept_item.get("claim_text", "").strip()
+            if len(claim_text) > len(kept_claim_text):
+                deduplicated[matched_idx] = item
+
+        detected = deduplicated
+        log.info("llm_claims_deduplicated", removed=removed_duplicates, kept=len(detected))
+
+        filtered_detected = []
+        for item in detected:
+            score = await self.detector.score_claim_worthiness(item.get("claim_text", ""))
+            if score >= 0.4:
+                filtered_detected.append(item)
+            else:
+                log.info(
+                    "claim_filtered_low_worthiness",
+                    claim=item.get("claim_text", "")[:80],
+                    score=score,
+                )
+
+        detected = filtered_detected
 
         # Build Claim objects from LLM results
         claims = []
@@ -294,9 +1238,18 @@ Transcript:
             if len(claim_text) < 10:
                 continue
 
+            context_lines = []
+            if line_idx > 0:
+                context_lines.append(merged[line_idx - 1]["text"])
+            if line_idx + 1 < len(merged):
+                context_lines.append(merged[line_idx + 1]["text"])
+            context_str = " ".join(context_lines)
+
             # Extract structured claim
             struct = await self.detector.extract_claim_struct(
-                claim_text, seg.get("speaker_label")
+                claim_text,
+                seg.get("speaker_label"),
+                context=context_str,
             )
 
             # Compute a worthiness score for the record

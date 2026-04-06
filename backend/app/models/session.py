@@ -14,16 +14,22 @@ class Session(TimestampMixin, Base):
         String(50), primary_key=True, default=partial(generate_prefixed_id, "sess")
     )
     title: Mapped[str | None] = mapped_column(String(500))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     source_url: Mapped[str | None] = mapped_column(String(2000))
     channel_name: Mapped[str | None] = mapped_column(String(200))
     broadcast_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     audio_file_path: Mapped[str | None] = mapped_column(String(1000))
+    thumbnail_path: Mapped[str | None] = mapped_column(String(1000))
+    media_type: Mapped[str] = mapped_column(String(20), default="audio")
     language: Mapped[str] = mapped_column(String(10), default="en")
     status: Mapped[str] = mapped_column(String(20), default="queued")
     # status: queued | processing | completed | failed
     processing_stage: Mapped[str | None] = mapped_column(String(50))
     # stage: asr | claim_detection | evidence_retrieval | verdict_generation
     progress_pct: Mapped[int] = mapped_column(Integer, default=0)
+    view_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
     duration_seconds: Mapped[int | None] = mapped_column(Integer)
     error_message: Mapped[str | None] = mapped_column(Text)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

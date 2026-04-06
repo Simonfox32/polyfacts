@@ -3,8 +3,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.auth import get_current_user, require_user
 from app.db import get_db
 from app.models.claim import Claim, EvidencePassage, Source
+from app.models.user import ClaimReaction, User
 from app.schemas.claim import (
     ClaimDetailResponse,
     ClaimSearchResponse,
@@ -143,3 +145,77 @@ async def get_claim_detail(claim_id: str, db: AsyncSession = Depends(get_db)):
         sources=[_build_source_response(p) for p in claim.evidence_passages],
         what_would_change_verdict=claim.what_would_change_verdict,
     )
+
+
+@router.post("/claims/{claim_id}/react")
+async def react_to_claim(
+    claim_id: str,
+    body: dict,
+    user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle agree/disagree on a claim."""
+    reaction = body.get("reaction")
+    if reaction not in ("agree", "disagree"):
+        raise HTTPException(status_code=400, detail="reaction must be 'agree' or 'disagree'")
+
+    existing = await db.execute(
+        select(ClaimReaction).where(
+            ClaimReaction.user_id == user.id, ClaimReaction.claim_id == claim_id
+        )
+    )
+    existing_reaction = existing.scalar_one_or_none()
+
+    if existing_reaction:
+        if existing_reaction.reaction == reaction:
+            await db.delete(existing_reaction)
+            await db.commit()
+            return {"status": "removed"}
+
+        existing_reaction.reaction = reaction
+        await db.commit()
+        return {"status": "switched", "reaction": reaction}
+
+    new_reaction = ClaimReaction(claim_id=claim_id, user_id=user.id, reaction=reaction)
+    db.add(new_reaction)
+    await db.commit()
+    return {"status": "reacted", "reaction": reaction}
+
+
+@router.get("/claims/{claim_id}/reactions")
+async def get_claim_reactions(
+    claim_id: str,
+    user: User | None = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get reaction counts for a claim."""
+    agree_count = (
+        await db.execute(
+            select(func.count()).where(
+                ClaimReaction.claim_id == claim_id, ClaimReaction.reaction == "agree"
+            )
+        )
+    ).scalar() or 0
+
+    disagree_count = (
+        await db.execute(
+            select(func.count()).where(
+                ClaimReaction.claim_id == claim_id, ClaimReaction.reaction == "disagree"
+            )
+        )
+    ).scalar() or 0
+
+    user_reaction = None
+    if user:
+        result = await db.execute(
+            select(ClaimReaction.reaction).where(
+                ClaimReaction.user_id == user.id, ClaimReaction.claim_id == claim_id
+            )
+        )
+        user_reaction = result.scalar_one_or_none()
+
+    return {
+        "agree_count": agree_count,
+        "disagree_count": disagree_count,
+        "user_reaction": user_reaction,
+    }

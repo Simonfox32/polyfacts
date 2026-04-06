@@ -1,10 +1,12 @@
+import os
+
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.routes import claims, clips, sessions
+from app.routes import auth, claims, clips, comments, media, search, sessions, user_features
 
 structlog.configure(
     processors=[
@@ -22,9 +24,11 @@ app = FastAPI(
     version="0.1.0",
 )
 
+cors_origins = os.environ.get("CORS_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,8 +36,13 @@ app.add_middleware(
 
 # Routes
 app.include_router(clips.router)
+app.include_router(auth.router)
 app.include_router(claims.router)
 app.include_router(sessions.router)
+app.include_router(media.router)
+app.include_router(comments.router)
+app.include_router(search.router)
+app.include_router(user_features.router)
 
 
 @app.get("/health")

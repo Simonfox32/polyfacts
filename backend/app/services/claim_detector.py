@@ -7,8 +7,8 @@ Stage 2: Claude Haiku structured extraction (normalized claim struct)
 import json
 import re
 
-import anthropic
 import structlog
+from openai import AsyncOpenAI
 
 from app.config import settings
 
@@ -37,13 +37,17 @@ Respond ONLY with a JSON object (no markdown, no explanation) with these fields:
   "required_evidence_types": ["primary_government_data", "court_record", "academic_study", "news_report", "expert_testimony", "legislative_record"]
 }}
 
+Context (surrounding transcript lines for reference): "{context}"
 Sentence: "{sentence}"
 Speaker: {speaker}"""
 
 
 class ClaimDetector:
     def __init__(self):
-        self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        self.client = AsyncOpenAI(
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
         self._classifier = None
 
     async def score_claim_worthiness(self, sentence: str) -> float:
@@ -101,6 +105,19 @@ class ClaimDetector:
         for kw in opinion_words:
             if kw in lower:
                 score -= 0.2
+                break
+
+        # Negative signals - reduce score for trivial/self-referential claims
+        text_lower = sentence.lower()
+        trivial_patterns = [
+            "i am ", "i have been ", "i serve on ", "i served ", "i was elected",
+            "i represent ", "my district ", "my state ", "i've been ",
+            "thank you ", "thanks for ", "good morning", "good afternoon",
+            "i want to thank", "i yield back", "i yield my time",
+        ]
+        for pattern in trivial_patterns:
+            if pattern in text_lower:
+                score -= 0.15
                 break
 
         # --- Positive signals ---
@@ -209,21 +226,22 @@ class ClaimDetector:
         return max(0.0, min(1.0, score))
 
     async def extract_claim_struct(
-        self, sentence: str, speaker: str | None = None
+        self, sentence: str, speaker: str | None = None, context: str | None = None
     ) -> dict:
         """Extract structured claim information using Claude Haiku."""
         prompt = CLAIM_EXTRACTION_PROMPT.format(
+            context=context or "No additional context available",
             sentence=sentence,
             speaker=speaker or "Unknown",
         )
 
-        response = await self.anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        response = await self.client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
         )
 
-        text = response.content[0].text.strip()
+        text = response.choices[0].message.content.strip()
         # Strip markdown code fences if present
         if text.startswith("```"):
             text = text.split("\n", 1)[1]
