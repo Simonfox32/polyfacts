@@ -4,22 +4,16 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
-    curl \
-    unzip \
     && rm -rf /var/lib/apt/lists/*
-
-# Install deno (needed for yt-dlp JS challenge solver)
-RUN curl -fsSL https://deno.land/install.sh | sh
-ENV DENO_DIR=/root/.deno
-ENV PATH="/root/.deno/bin:${PATH}"
 
 WORKDIR /app
 
-# Copy and install Python dependencies
+# Copy and install Python dependencies first (better caching)
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e "."
+COPY app ./app
+RUN pip install --no-cache-dir "."
 
-# Copy application code
+# Copy remaining application code
 COPY . .
 
 # Create uploads directory
