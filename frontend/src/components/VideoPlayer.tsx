@@ -305,7 +305,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
               className={
                 isFullscreen
                   ? "max-h-full max-w-full cursor-pointer bg-black object-contain"
-                  : "block aspect-video w-full cursor-pointer bg-black object-contain"
+                  : "block w-full cursor-pointer bg-black"
               }
               src={sourceUrl}
               preload="metadata"
