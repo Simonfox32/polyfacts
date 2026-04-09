@@ -434,10 +434,6 @@ Respond ONLY with a JSON object:
             # Use up to 4 frames to keep costs reasonable.
             frames_to_send = frame_paths[:4]
 
-            import anthropic
-
-            client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-
             content: list[dict] = []
             for frame_path in frames_to_send:
                 with open(frame_path, "rb") as frame_file:
@@ -458,24 +454,24 @@ Respond ONLY with a JSON object:
                     "type": "text",
                     "text": (
                         "These frames are from a political broadcast "
-                        "(congressional hearing, news interview, etc). "
-                        "Identify ALL people visible in these frames. "
-                        "For each person, provide their full name and title/role. "
-                        "Focus on the main speakers — the people at microphones, "
-                        "at the witness table, or behind nameplates.\n\n"
-                        "Look for clues: nameplates, lower-third graphics, chyrons, "
-                        "seating positions. The person at the witness table facing "
-                        "the committee is typically the person testifying. "
-                        "People on the raised dais/platform are typically senators "
-                        "or committee members.\n\n"
-                        "Respond ONLY with a JSON array of strings, each being a "
-                        "person's identity:\n"
-                        '["Kash Patel, FBI Director", "Senator Cory Booker"]'
+                        "(congressional hearing, news show, press conference, etc). "
+                        "Identify ALL people visible in these frames.\n\n"
+                        "FIRST: Read ANY on-screen text — chyrons, lower-thirds, "
+                        "name graphics, network bugs, tickers. These are the most "
+                        "reliable identification source.\n\n"
+                        "SECOND: Identify people by face recognition if you recognize "
+                        "them as public figures (politicians, journalists, anchors, etc).\n\n"
+                        "THIRD: Use context clues — seating position, microphone, "
+                        "attire, studio set design.\n\n"
+                        "For each person provide their FULL NAME and current title/role. "
+                        "Be specific — 'Trey Yingst, Fox News Correspondent' not just 'reporter'.\n\n"
+                        "Respond ONLY with a JSON array of strings:\n"
+                        '["Harry Enten, CNN Data Analyst", "Trey Yingst, Fox News Correspondent"]'
                     ),
                 }
             )
 
-            response = client.messages.create(
+            response = await self.anthropic_client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=500,
                 messages=[{"role": "user", "content": content}],
