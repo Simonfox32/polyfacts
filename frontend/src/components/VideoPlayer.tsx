@@ -270,7 +270,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         }}
         style={isFullscreen && !controlsVisible ? { cursor: "none" } : undefined}
       >
-        <div className={isFullscreen ? "relative flex-1 flex flex-col items-center justify-center bg-black" : "relative bg-black"}>
+        <div className={isFullscreen ? "relative flex-1 flex flex-col items-center justify-center bg-black" : "relative bg-black leading-[0]"}>
           {mediaType === "audio" && (
             <div className="flex aspect-video items-center justify-center bg-gradient-to-br from-gray-950 via-gray-900 to-black px-6">
               <div className="w-full max-w-3xl rounded-[24px] border border-white/10 bg-white/5 p-6 backdrop-blur">
@@ -305,7 +305,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
               className={
                 isFullscreen
                   ? "max-h-full max-w-full cursor-pointer bg-black object-contain"
-                  : "aspect-video w-full cursor-pointer bg-black"
+                  : "block aspect-video w-full cursor-pointer bg-black object-contain"
               }
               src={sourceUrl}
               preload="metadata"
