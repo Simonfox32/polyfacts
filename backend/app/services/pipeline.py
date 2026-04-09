@@ -1245,6 +1245,11 @@ Transcript:
                 context_lines.append(merged[line_idx + 1]["text"])
             context_str = " ".join(context_lines)
 
+            # LLM relevance filter — reject trivial/procedural statements
+            if not await self.detector.is_relevant_claim(claim_text, context_str):
+                log.info("claim_rejected_by_llm", claim=claim_text[:80])
+                continue
+
             # Extract structured claim
             struct = await self.detector.extract_claim_struct(
                 claim_text,
@@ -1288,6 +1293,11 @@ Transcript:
 
                 score = await self.detector.score_claim_worthiness(sentence)
                 if score < settings.claim_worthiness_threshold:
+                    continue
+
+                # LLM relevance filter — reject trivial/procedural statements
+                if not await self.detector.is_relevant_claim(sentence, seg["text"]):
+                    log.info("claim_rejected_by_llm", sentence=sentence[:80])
                     continue
 
                 struct = await self.detector.extract_claim_struct(

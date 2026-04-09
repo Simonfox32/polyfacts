@@ -80,6 +80,21 @@ class ClaimDetector:
             "i'd like to", "i want to ask", "can you tell",
             "would you agree", "isn't it true that", "do you believe",
             "alright", "okay so", "moving on",
+            # Procedural/logistical speech — not checkable claims
+            "i gave them", "i gave him", "i gave her",
+            "i told them", "i told him", "i told her",
+            "i asked them", "i asked him", "i asked her",
+            "an extension", "days is up", "days are up",
+            "we're going to", "we are going to", "we'll see",
+            "we'll find out", "we'll know", "stay tuned",
+            "i guess", "so basically", "you know what",
+            "that's what happened", "that's what we did",
+            "the fact is", "the reality is", "the truth is",
+            "let me tell you", "i'll tell you", "i will say",
+            "look,", "look ", "listen,", "listen ",
+            "by the way", "as you know", "everybody knows",
+            "we had a", "we have a", "there was a",
+            "i said", "he said", "she said", "they said",
         ]
         for pattern in procedural_patterns:
             if pattern in lower:
@@ -224,6 +239,38 @@ class ClaimDetector:
             score += 0.05
 
         return max(0.0, min(1.0, score))
+
+    async def is_relevant_claim(self, sentence: str, context: str | None = None) -> bool:
+        """LLM filter: reject trivial, procedural, or uncheckable statements."""
+        prompt = (
+            "You are a political fact-checking relevance filter.\n\n"
+            "Decide if this statement is a CHECKABLE FACTUAL CLAIM that a voter or journalist "
+            "would find important to verify. Answer ONLY 'yes' or 'no'.\n\n"
+            "Reject:\n"
+            "- Procedural statements (extensions, scheduling, yielding time)\n"
+            "- Self-referential narration (\"I gave them\", \"I told him\")\n"
+            "- Vague or conversational filler\n"
+            "- Opinions without factual basis\n"
+            "- Routine uncontested facts everyone agrees on\n\n"
+            "Accept:\n"
+            "- Statistics, numbers, percentages\n"
+            "- Policy outcomes or impacts\n"
+            "- Historical claims that can be verified\n"
+            "- Accusations or attributions of actions\n\n"
+            f"Context: {context or 'None'}\n"
+            f"Statement: \"{sentence}\"\n\n"
+            "Is this a checkable, important factual claim? (yes/no)"
+        )
+        try:
+            response = await self.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                max_tokens=5,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            answer = response.choices[0].message.content.strip().lower()
+            return answer.startswith("yes")
+        except Exception:
+            return True  # On error, let the claim through
 
     async def extract_claim_struct(
         self, sentence: str, speaker: str | None = None, context: str | None = None

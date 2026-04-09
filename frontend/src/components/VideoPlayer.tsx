@@ -122,15 +122,16 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
           mediaRef.current.muted = !mediaRef.current.muted;
         },
         toggleFullscreen() {
-          if (!playerShellRef.current) {
+          const video = mediaRef.current as HTMLVideoElement | null;
+          if (video && typeof (video as any).webkitEnterFullscreen === "function") {
+            (video as any).webkitEnterFullscreen();
             return;
           }
-
+          if (!playerShellRef.current) return;
           if (document.fullscreenElement) {
             void document.exitFullscreen();
             return;
           }
-
           void playerShellRef.current.requestFullscreen();
         },
       }),
@@ -158,12 +159,14 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
 
     useEffect(() => {
       const handleFullscreenChange = () => {
-        setIsFullscreen(Boolean(document.fullscreenElement));
+        setIsFullscreen(Boolean(document.fullscreenElement || (document as any).webkitFullscreenElement));
       };
 
       document.addEventListener("fullscreenchange", handleFullscreenChange);
+      document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
       return () => {
         document.removeEventListener("fullscreenchange", handleFullscreenChange);
+        document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
       };
     }, []);
 
@@ -223,6 +226,21 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     }
 
     async function toggleFullscreen() {
+      // iOS Safari: use native video fullscreen (webkitEnterFullscreen)
+      const video = mediaRef.current as HTMLVideoElement | null;
+      if (video && typeof (video as any).webkitEnterFullscreen === "function") {
+        if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
+          if (typeof (video as any).webkitExitFullscreen === "function") {
+            (video as any).webkitExitFullscreen();
+          } else if (document.exitFullscreen) {
+            await document.exitFullscreen();
+          }
+        } else {
+          (video as any).webkitEnterFullscreen();
+        }
+        return;
+      }
+
       if (!playerShellRef.current) {
         return;
       }
