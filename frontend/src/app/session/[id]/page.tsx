@@ -163,6 +163,9 @@ export default function SessionDetailPage() {
         setSession(sessionData);
         setTranscript(transcriptData);
         setClaims(claimsData.results || []);
+
+        // Increment view count (fire and forget)
+        fetch(`/api/sessions/${sessionId}/view`, { method: "POST" }).catch(() => {});
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError instanceof Error ? loadError.message : "Unable to load session");
