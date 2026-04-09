@@ -214,6 +214,39 @@ async def get_transcript(session_id: str, db: AsyncSession = Depends(get_db)):
     ]
 
 
+class RenameSpeakerRequest(PydanticBaseModel):
+    old_name: str
+    new_name: str
+
+
+@router.put("/{session_id}/speakers")
+async def rename_speaker(
+    session_id: str,
+    body: RenameSpeakerRequest,
+    db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """Rename a speaker across all transcript segments and claims for a session."""
+    # Update transcript segments
+    await db.execute(
+        text(
+            "UPDATE transcript_segments SET speaker_label = :new_name "
+            "WHERE session_id = :sid AND speaker_label = :old_name"
+        ),
+        {"new_name": body.new_name, "old_name": body.old_name, "sid": session_id},
+    )
+    # Update claims
+    await db.execute(
+        text(
+            "UPDATE claims SET speaker_label = :new_name "
+            "WHERE session_id = :sid AND speaker_label = :old_name"
+        ),
+        {"new_name": body.new_name, "old_name": body.old_name, "sid": session_id},
+    )
+    await db.commit()
+    return {"status": "ok", "old_name": body.old_name, "new_name": body.new_name}
+
+
 @router.delete("/{session_id}", status_code=200)
 async def delete_session(
     session_id: str,

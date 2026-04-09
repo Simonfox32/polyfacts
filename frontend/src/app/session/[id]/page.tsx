@@ -887,9 +887,35 @@ export default function SessionDetailPage() {
                   .map((speaker) => (
                     <span
                       key={speaker}
-                      className="rounded-full border border-gray-200 bg-white px-3 py-1 text-xs font-medium text-gray-700"
+                      className="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-3 py-1 text-xs font-medium text-gray-700"
                     >
                       {speaker}
+                      {user?.is_admin && speaker !== "No speaker labels" && (
+                        <button
+                          type="button"
+                          className="ml-1 text-gray-400 hover:text-gray-700"
+                          title="Rename speaker"
+                          onClick={() => {
+                            const newName = prompt(`Rename "${speaker}" to:`, speaker);
+                            if (newName && newName !== speaker) {
+                              fetch(`/api/sessions/${session.session_id}/speakers`, {
+                                method: "PUT",
+                                headers: {
+                                  "Content-Type": "application/json",
+                                  ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                                },
+                                body: JSON.stringify({ old_name: speaker, new_name: newName }),
+                              }).then((res) => {
+                                if (res.ok) window.location.reload();
+                              });
+                            }
+                          }}
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="h-3 w-3">
+                            <path d="M13.488 2.513a1.75 1.75 0 0 0-2.475 0L3.05 10.476a1 1 0 0 0-.263.47l-.758 2.903a.75.75 0 0 0 .917.917l2.903-.758a1 1 0 0 0 .47-.263l7.963-7.963a1.75 1.75 0 0 0 0-2.475l-.794-.794Z" />
+                          </svg>
+                        </button>
+                      )}
                     </span>
                   ))}
               </div>
