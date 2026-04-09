@@ -947,6 +947,11 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
                         all_ids = json.loads(result_text[json_start:json_end])
                         for label, info in all_ids.items():
                             if label not in speaker_map and isinstance(info, dict):
+                                name = info.get("name", "")
+                                # Reject generic/unknown labels — let fallbacks handle them
+                                if "unknown" in name.lower() or "unidentified" in name.lower():
+                                    log.info("speaker_id_rejected_generic", label=label, name=name)
+                                    continue
                                 speaker_map[label] = info
                                 log.info("speaker_identified", label=label, info=info)
                     break
@@ -1143,6 +1148,96 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
                 speaker_map[still_unidentified[0]] = {"name": unused_names[0], "party": None}
                 log.info("speaker_assigned_by_elimination",
                          label=still_unidentified[0], name=unused_names[0])
+
+        # Brave Search resolution: for speakers with only a first name or still unidentified,
+        # search for their full identity using transcript context
+        if settings.brave_search_api_key:
+            import httpx
+
+            # Collect first names and context from transcript introductions
+            intro_pattern = _re.compile(
+                r"(?:correspondent|reporter|anchor|host|analyst|commentator|senator|"
+                r"representative|secretary|director|governor|attorney general)\s+"
+                r"([A-Z][a-z]+)",
+                _re.IGNORECASE,
+            )
+            # Also match "Name, Title" pattern
+            name_title_pattern = _re.compile(
+                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?),?\s+"
+                r"(?:chief|senior|lead|deputy)?\s*"
+                r"(?:foreign |national |political |data |legal )?"
+                r"(?:correspondent|reporter|anchor|analyst|commentator|editor)",
+                _re.IGNORECASE,
+            )
+
+            transcript_text = " ".join(s.get("text", "") for s in merged_segments[:10])
+            partial_names: dict[str, str] = {}  # name -> context for search
+
+            for match in intro_pattern.finditer(transcript_text):
+                name = match.group(1)
+                # Get surrounding context for the search
+                start = max(0, match.start() - 30)
+                end = min(len(transcript_text), match.end() + 30)
+                context = transcript_text[start:end].strip()
+                partial_names[name] = context
+
+            for match in name_title_pattern.finditer(transcript_text):
+                name = match.group(1)
+                context = match.group(0)
+                partial_names[name] = context
+
+            # For greeting-assigned speakers with only a first name, resolve via search
+            speakers_to_resolve = {}
+            for label, info in speaker_map.items():
+                name = info.get("name", "") if isinstance(info, dict) else info
+                # Single word name = just a first name, needs resolution
+                if name and " " not in name and name in partial_names:
+                    speakers_to_resolve[label] = (name, partial_names[name])
+
+            # Also try to resolve completely unidentified speakers
+            final_unidentified = [l for l in unique_speakers if l not in speaker_map]
+            for label in final_unidentified:
+                # Check if any partial name from the transcript could be this speaker
+                for first_name, context in partial_names.items():
+                    if first_name not in [
+                        info.get("name", "") if isinstance(info, dict) else info
+                        for info in speaker_map.values()
+                    ]:
+                        speakers_to_resolve[label] = (first_name, context)
+                        break
+
+            if speakers_to_resolve:
+                try:
+                    async with httpx.AsyncClient(timeout=10) as http_client:
+                        for label, (first_name, context) in speakers_to_resolve.items():
+                            query = f'"{first_name}" {context}'
+                            try:
+                                resp = await http_client.get(
+                                    "https://api.search.brave.com/res/v1/web/search",
+                                    params={"q": query, "count": 3},
+                                    headers={"X-Subscription-Token": settings.brave_search_api_key},
+                                )
+                                if resp.status_code == 200:
+                                    results = resp.json().get("web", {}).get("results", [])
+                                    for r in results:
+                                        title = r.get("title", "")
+                                        desc = r.get("description", "")
+                                        combined = f"{title} {desc}"
+                                        # Look for "FirstName LastName" pattern in results
+                                        name_match = _re.search(
+                                            rf"\b{first_name}\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+                                            combined,
+                                        )
+                                        if name_match:
+                                            full_name = f"{first_name} {name_match.group(1)}"
+                                            speaker_map[label] = {"name": full_name, "party": None}
+                                            log.info("speaker_resolved_via_brave",
+                                                     label=label, query=query[:80], result=full_name)
+                                            break
+                            except Exception as e:
+                                log.warning("brave_speaker_resolve_failed", error=str(e))
+                except Exception as e:
+                    log.warning("brave_resolve_session_failed", error=str(e))
 
         # Apply the mapping to all segments
         for seg in segments:
