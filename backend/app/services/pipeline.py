@@ -1253,8 +1253,38 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
         for seg in segments:
             label = seg.get("speaker_label", "")
             if "_response" in label:
-                base_label = label.replace("_response", "")
                 seg["speaker_label"] = "Respondent"
+
+        # Give remaining "Speaker N" labels a descriptive role estimate
+        for seg in segments:
+            label = seg.get("speaker_label", "")
+            if not _re.match(r"^Speaker \d+$", label):
+                continue
+            # Analyze this speaker's segments to guess their role
+            speaker_segs = [s for s in segments if s.get("speaker_label") == label]
+            all_text = " ".join(s.get("text", "") for s in speaker_segs).lower()
+            question_count = sum(1 for s in speaker_segs if "?" in s.get("text", ""))
+            total = max(len(speaker_segs), 1)
+            question_ratio = question_count / total
+
+            if question_ratio > 0.4:
+                role = "Unidentified Interviewer"
+            elif any(w in all_text for w in ["we reported", "sources say", "breaking", "back to you"]):
+                role = "Unidentified Correspondent"
+            elif any(w in all_text for w in ["the president", "the administration", "white house"]):
+                role = "Unidentified Political Commentator"
+            elif any(w in all_text for w in ["data shows", "numbers", "polling", "percent"]):
+                role = "Unidentified Analyst"
+            elif any(w in all_text for w in ["i serve", "my district", "legislation", "the bill"]):
+                role = "Unidentified Legislator"
+            else:
+                role = "Unidentified Speaker"
+
+            # Apply to all segments with this label
+            for s in segments:
+                if s.get("speaker_label") == label:
+                    s["speaker_label"] = role
+            log.info("speaker_role_estimated", original=label, role=role)
 
         log.info("speakers_identified_all", mapping=speaker_map)
         return segments
