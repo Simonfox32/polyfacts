@@ -277,13 +277,23 @@ Respond ONLY with a JSON object:
             r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"
         )
 
-        # Name followed by title/role: "Harry Enten, Chief Data Analyst"
+        # Name followed by comma and any descriptor: "Michael Allen, former NSC director"
         name_then_title = re.compile(
-            r"\b([A-Z][a-z]+\s+[A-Z][a-z]+),?\s+"
-            r"(?:Chief|Senior|Lead|Deputy|Assistant|Associate|Former|Acting)?\s*"
-            r"(?:Data |Political |National |White House |Legal )?"
-            r"(?:Analyst|Correspondent|Reporter|Anchor|Host|Commentator|Editor|"
-            r"Strategist|Advisor|Adviser|Director|Secretary|Producer|Journalist)\b"
+            r"\b([A-Z][a-z]+\s+[A-Z][a-z]+),\s+"
+            r"(?:former |current |acting )?"
+            r"[A-Za-z\s]{5,50}?"
+            r"(?:director|analyst|correspondent|reporter|anchor|host|commentator|"
+            r"editor|strategist|advisor|adviser|secretary|producer|journalist|"
+            r"attorney|counsel|chairman|chairwoman|spokesperson|professor|"
+            r"officer|chief|manager|expert|fellow|scholar)\b",
+            re.IGNORECASE,
+        )
+
+        # Introduction patterns: "bring in [Name]", "joining us is [Name]"
+        intro_pattern = re.compile(
+            r"(?:bring in|joining us(?: is)?|let's talk to|welcome|here's|"
+            r"joined by|we have|talk with|speak with)\s+"
+            r"([A-Z][a-z]+\s+[A-Z][a-z]+)",
         )
 
         names = set()
@@ -292,7 +302,10 @@ Respond ONLY with a JSON object:
             for title, name in title_before.findall(text):
                 names.add(f"{title} {name}")
             for match in name_then_title.finditer(text):
-                names.add(match.group(0).rstrip(","))
+                # Extract just the name part (before the comma)
+                names.add(match.group(1))
+            for match in intro_pattern.finditer(text):
+                names.add(match.group(1))
         return sorted(names)
 
     @staticmethod
@@ -1068,9 +1081,14 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
                         break
 
         # Fallback: detect introduction-then-handoff patterns
-        # E.g., Speaker 0: "...correspondent Trey live in Israel. Good morning, Trey."
-        #        Speaker 1: "Yeah, good morning..." → Speaker 1 IS Trey
         import re as _re
+
+        # Pattern 1: "bring in/joining us [Full Name]" → next different speaker IS that person
+        intro_re = _re.compile(
+            r"(?:bring in|joining us(?: is)?|let'?s talk to|joined by|we have|"
+            r"talk with|speak with|welcome)\s+"
+            r"([A-Z][a-z]+\s+[A-Z][a-z]+)",
+        )
         for idx, seg in enumerate(merged_segments[:-1]):
             text = seg.get("text", "")
             speaker = seg.get("speaker_label", "")
@@ -1080,17 +1098,23 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
             if next_speaker in speaker_map or next_speaker == speaker:
                 continue
 
-            # Pattern: "Good morning/evening, [Name]" at end of segment
+            intro_match = intro_re.search(text)
+            if intro_match:
+                introduced_name = intro_match.group(1)
+                speaker_map[next_speaker] = {"name": introduced_name, "party": None}
+                log.info("speaker_assigned_from_introduction",
+                         label=next_speaker, name=introduced_name)
+                continue
+
+            # Pattern 2: "Good morning, [Name]" → next speaker responds
             greeting_match = _re.search(
                 r"(?:good morning|good evening|good afternoon|welcome),?\s+([A-Z][a-z]+)",
                 text, _re.IGNORECASE
             )
             if greeting_match:
                 greeted_name = greeting_match.group(1)
-                # The next speaker who responds is the greeted person
                 next_text = next_seg.get("text", "").lower()
-                if any(r in next_text[:50] for r in ["yeah", "hey", "good morning", "good evening", "thank", "thanks"]):
-                    # Try to find full name from face_ids or all_names_mentioned
+                if any(r in next_text[:50] for r in ["yeah", "hey", "good morning", "good evening", "thank", "thanks", "well", "so"]):
                     full_name = greeted_name
                     for fid in face_ids:
                         if greeted_name.lower() in fid.lower():
