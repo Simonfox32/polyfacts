@@ -376,16 +376,19 @@ Respond ONLY with a JSON object:
         return unique
 
     async def _identify_faces_from_video(self, video_path: str) -> list[str]:
-        """Extract frames from video and use Claude Vision to identify public figures.
+        """Extract frames from video, read on-screen text, and use Brave Search
+        to identify speakers via reverse lookup.
 
         Returns a list of identified person descriptions like:
-        ["Kash Patel, FBI Director", "Senator Cory Booker"]
+        ["Trey Yingst, Fox News Chief Foreign Correspondent"]
         """
         import base64
         import os
         import shutil
         import subprocess
         import tempfile
+
+        import httpx
 
         if not video_path:
             return []
@@ -399,7 +402,7 @@ Respond ONLY with a JSON object:
         identified_people: list[str] = []
 
         try:
-            # Extract frames at different timestamps to catch different speakers.
+            # Extract frames at different timestamps to catch different speakers
             timestamps = ["3", "10", "30", "60", "90", "120"]
             frame_paths = []
 
@@ -408,17 +411,8 @@ Respond ONLY with a JSON object:
                 try:
                     subprocess.run(
                         [
-                            "ffmpeg",
-                            "-ss",
-                            ts,
-                            "-i",
-                            video_path,
-                            "-frames:v",
-                            "1",
-                            "-q:v",
-                            "2",
-                            "-y",
-                            frame_path,
+                            "ffmpeg", "-ss", ts, "-i", video_path,
+                            "-frames:v", "1", "-q:v", "2", "-y", frame_path,
                         ],
                         capture_output=True,
                         timeout=10,
@@ -431,49 +425,41 @@ Respond ONLY with a JSON object:
             if not frame_paths:
                 return []
 
-            # Use up to 4 frames to keep costs reasonable.
+            # Step 1: Send frames to Claude to read ALL on-screen text
             frames_to_send = frame_paths[:4]
-
             content: list[dict] = []
             for frame_path in frames_to_send:
                 with open(frame_path, "rb") as frame_file:
                     image_data = base64.b64encode(frame_file.read()).decode("utf-8")
-                content.append(
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_data,
-                        },
-                    }
-                )
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_data,
+                    },
+                })
 
-            content.append(
-                {
-                    "type": "text",
-                    "text": (
-                        "These frames are from a political broadcast "
-                        "(congressional hearing, news show, press conference, etc). "
-                        "Identify ALL people visible in these frames.\n\n"
-                        "FIRST: Read ANY on-screen text — chyrons, lower-thirds, "
-                        "name graphics, network bugs, tickers. These are the most "
-                        "reliable identification source.\n\n"
-                        "SECOND: Identify people by face recognition if you recognize "
-                        "them as public figures (politicians, journalists, anchors, etc).\n\n"
-                        "THIRD: Use context clues — seating position, microphone, "
-                        "attire, studio set design.\n\n"
-                        "For each person provide their FULL NAME and current title/role. "
-                        "Be specific — 'Trey Yingst, Fox News Correspondent' not just 'reporter'.\n\n"
-                        "Respond ONLY with a JSON array of strings:\n"
-                        '["Harry Enten, CNN Data Analyst", "Trey Yingst, Fox News Correspondent"]'
-                    ),
-                }
-            )
+            content.append({
+                "type": "text",
+                "text": (
+                    "Read ALL text visible on screen in these video frames. "
+                    "Focus especially on:\n"
+                    "1. Lower-third name graphics (e.g. 'TREY YINGST | FOX NEWS')\n"
+                    "2. Chyrons and tickers\n"
+                    "3. Network logos (FOX NEWS, CNN, MSNBC, etc)\n"
+                    "4. Any names, titles, or show names\n\n"
+                    "Also describe each distinct person visible (appearance, position).\n\n"
+                    "Respond with JSON:\n"
+                    '{"on_screen_text": ["TREY YINGST", "FOX NEWS ALERT", ...], '
+                    '"people": [{"description": "blonde woman at anchor desk", '
+                    '"visible_name_graphic": "KAYLEIGH MCENANY"}, ...]}'
+                ),
+            })
 
             response = await self.anthropic_client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=500,
+                max_tokens=800,
                 messages=[{"role": "user", "content": content}],
             )
 
@@ -484,13 +470,74 @@ Respond ONLY with a JSON object:
                 result_text = result_text.rsplit("```", 1)[0]
             result_text = result_text.strip()
 
-            json_start = result_text.find("[")
-            json_end = result_text.rfind("]") + 1
+            json_start = result_text.find("{")
+            json_end = result_text.rfind("}") + 1
+            vision_data = {}
             if json_start >= 0 and json_end > json_start:
-                people = json.loads(result_text[json_start:json_end])
-                if isinstance(people, list):
-                    identified_people = [str(person) for person in people if person]
-                    log.info("face_id_results", people=identified_people)
+                vision_data = json.loads(result_text[json_start:json_end])
+
+            log.info("vision_screen_read", data=str(vision_data)[:500])
+
+            # Collect names from vision — both on_screen_text and people with visible names
+            screen_names = []
+            for person in vision_data.get("people", []):
+                name = person.get("visible_name_graphic", "")
+                if name and len(name) > 2:
+                    screen_names.append(name)
+
+            # Step 2: For any partial names or descriptions, search Brave for full identity
+            all_text = vision_data.get("on_screen_text", [])
+            # Filter for likely name strings (capitalized, 2+ words)
+            import re as _re
+            name_candidates = []
+            for t in all_text + screen_names:
+                # Skip network names, generic labels
+                if any(skip in t.upper() for skip in [
+                    "BREAKING", "ALERT", "LIVE", "EXCLUSIVE", "NEWS",
+                    "CHANNEL", "PREDICTION", "TRACKER",
+                ]):
+                    continue
+                # Looks like a name: 2+ capitalized words
+                if _re.match(r"^[A-Z][a-z]+ [A-Z][a-z]+", t) or _re.match(r"^[A-Z]{2,} [A-Z]{2,}", t):
+                    name_candidates.append(t)
+
+            # Also add names from people descriptions
+            for person in vision_data.get("people", []):
+                name = person.get("visible_name_graphic", "")
+                if name and name not in name_candidates:
+                    name_candidates.append(name)
+
+            if not name_candidates and not screen_names:
+                return []
+
+            # Step 3: Search Brave for each name candidate to get full identity
+            if settings.brave_search_api_key:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    for name in name_candidates[:4]:
+                        try:
+                            resp = await client.get(
+                                "https://api.search.brave.com/res/v1/web/search",
+                                params={"q": f'"{name}" journalist OR correspondent OR anchor OR politician OR senator'},
+                                headers={"X-Subscription-Token": settings.brave_search_api_key},
+                            )
+                            if resp.status_code == 200:
+                                results = resp.json().get("web", {}).get("results", [])
+                                if results:
+                                    # Use the first result's title/description to get full identity
+                                    title = results[0].get("title", "")
+                                    desc = results[0].get("description", "")
+                                    identified_people.append(f"{name} (from search: {title[:100]})")
+                                    log.info("brave_speaker_lookup", name=name, result=title[:100])
+                        except Exception as e:
+                            log.warning("brave_speaker_lookup_failed", name=name, error=str(e))
+                            continue
+
+            # If we got screen names directly, use those too
+            for name in screen_names:
+                if not any(name.lower() in p.lower() for p in identified_people):
+                    identified_people.append(name)
+
+            log.info("face_id_results", people=identified_people)
 
         except Exception as e:
             log.warning("face_id_failed", error=str(e))
