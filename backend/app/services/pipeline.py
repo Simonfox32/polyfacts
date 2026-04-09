@@ -472,7 +472,7 @@ Respond ONLY with a JSON object:
             )
 
             response = await self.anthropic_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-4-20250514",
                 max_tokens=500,
                 messages=[{"role": "user", "content": content}],
             )
@@ -1015,9 +1015,43 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
                         )
                         break
 
-        # Fallback: if speakers are still unidentified, try matching names mentioned
-        # in the transcript to speakers based on introduction patterns.
-        # E.g., "Harry Enten, Chief Data Analyst" at segment start = that speaker is Harry Enten
+        # Fallback: detect introduction-then-handoff patterns
+        # E.g., Speaker 0: "...correspondent Trey live in Israel. Good morning, Trey."
+        #        Speaker 1: "Yeah, good morning..." → Speaker 1 IS Trey
+        import re as _re
+        for idx, seg in enumerate(merged_segments[:-1]):
+            text = seg.get("text", "")
+            speaker = seg.get("speaker_label", "")
+            next_seg = merged_segments[idx + 1]
+            next_speaker = next_seg.get("speaker_label", "")
+
+            if next_speaker in speaker_map or next_speaker == speaker:
+                continue
+
+            # Pattern: "Good morning/evening, [Name]" at end of segment
+            greeting_match = _re.search(
+                r"(?:good morning|good evening|good afternoon|welcome),?\s+([A-Z][a-z]+)",
+                text, _re.IGNORECASE
+            )
+            if greeting_match:
+                greeted_name = greeting_match.group(1)
+                # The next speaker who responds is the greeted person
+                next_text = next_seg.get("text", "").lower()
+                if any(r in next_text[:50] for r in ["yeah", "hey", "good morning", "good evening", "thank", "thanks"]):
+                    # Try to find full name from face_ids or all_names_mentioned
+                    full_name = greeted_name
+                    for fid in face_ids:
+                        if greeted_name.lower() in fid.lower():
+                            full_name = fid
+                            break
+                    for nm in all_names_mentioned:
+                        if greeted_name.lower() in nm.lower():
+                            full_name = nm
+                            break
+                    speaker_map[next_speaker] = {"name": full_name, "party": None}
+                    log.info("speaker_assigned_from_greeting", label=next_speaker, name=full_name)
+
+        # Also try matching names mentioned in transcript to speakers
         remaining_unidentified = [l for l in unique_speakers if l not in speaker_map]
         if remaining_unidentified and all_names_mentioned:
             import re as _re
