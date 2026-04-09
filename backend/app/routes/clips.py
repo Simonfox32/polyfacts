@@ -168,9 +168,6 @@ async def _download_and_process_url(session_id: str, source_url: str) -> None:
             rc, _, stderr_out = await _run_ytdlp([
                 "yt-dlp",
                 "--no-playlist",
-                "--cookies-from-browser", "chrome",
-                "--remote-components", "ejs:github",
-                "--remote-components", "ejs:npm",
                 "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
                 "--merge-output-format", "mp4",
                 "-o", f"{download_base}.%(ext)s",
@@ -185,9 +182,6 @@ async def _download_and_process_url(session_id: str, source_url: str) -> None:
                 rc, _, stderr_out = await _run_ytdlp([
                     "yt-dlp",
                     "--no-playlist",
-                    "--cookies-from-browser", "chrome",
-                "--remote-components", "ejs:github",
-                "--remote-components", "ejs:npm",
                     "-f", "bv*[height<=720]+ba/b[height<=720]/bv+ba/b",
                     "--merge-output-format", "mp4",
                     "-o", f"{download_base}.%(ext)s",
