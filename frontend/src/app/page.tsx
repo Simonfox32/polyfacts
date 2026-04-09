@@ -368,19 +368,14 @@ function HomeInner() {
         )}
 
         <section className="mt-6">
-          <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <h2 className="text-lg font-semibold text-gray-950">
-                {query ? "Search feed" : "Recommended for review"}
-              </h2>
+          {query && (
+            <div className="mb-4">
+              <h2 className="text-lg font-semibold text-gray-950">Search feed</h2>
               <p className="mt-1 text-sm text-gray-500">
-                {query
-                  ? "Sessions and claim moments are blended into one browsing grid."
-                  : "Recent uploads with fast verdict visibility and watch-page deep links."}
+                Sessions and claim moments are blended into one browsing grid.
               </p>
             </div>
-            {!query && <span className="text-sm text-gray-400">{sessions.length} loaded</span>}
-          </div>
+          )}
 
           {loading ? (
             <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
