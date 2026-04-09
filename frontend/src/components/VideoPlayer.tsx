@@ -414,7 +414,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             className={
               isFullscreen
                 ? `absolute bottom-0 left-0 right-0 space-y-4 bg-gradient-to-t from-black/90 via-black/60 to-transparent p-4 text-white transition-opacity duration-300 ${controlsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`
-                : `space-y-4 bg-[#0f0f0f] p-4 text-white transition-opacity duration-300 ${controlsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`
+                : `absolute bottom-0 left-0 right-0 space-y-4 bg-gradient-to-t from-black/90 via-black/60 to-transparent p-4 text-white transition-opacity duration-300 ${controlsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`
             }
           >
             <div className="relative px-1 pt-3">
