@@ -8,10 +8,10 @@ import time
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
+import anthropic
 import httpx
 import openai
 import structlog
-from openai import AsyncOpenAI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,10 +24,7 @@ log = structlog.get_logger()
 class EvidenceRetriever:
     def __init__(self):
         self.openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
-        self.groq_client = AsyncOpenAI(
-            api_key=settings.groq_api_key,
-            base_url="https://api.groq.com/openai/v1",
-        )
+        self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self._api_cache: dict[str, dict] = {}
 
@@ -117,8 +114,8 @@ class EvidenceRetriever:
         )
 
         try:
-            response = await self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            response = await self.anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514",
                 max_tokens=512,
                 messages=[{
                     "role": "user",
@@ -126,7 +123,7 @@ class EvidenceRetriever:
                 }],
             )
 
-            response_text = (response.choices[0].message.content or "").strip()
+            response_text = response.content[0].text.strip()
             if response_text.startswith("```"):
                 response_text = response_text.split("\n", 1)[1]
             if response_text.endswith("```"):

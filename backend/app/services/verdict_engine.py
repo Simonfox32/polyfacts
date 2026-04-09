@@ -8,8 +8,8 @@ import json
 import re
 from datetime import datetime, timezone
 
+import anthropic
 import structlog
-from openai import AsyncOpenAI
 
 from app.config import settings
 
@@ -52,10 +52,7 @@ Respond ONLY with a JSON object (no markdown, no explanation):
 
 class VerdictEngine:
     def __init__(self):
-        self.client = AsyncOpenAI(
-            api_key=settings.groq_api_key,
-            base_url="https://api.groq.com/openai/v1",
-        )
+        self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     async def generate_verdict(
         self,
@@ -106,17 +103,17 @@ class VerdictEngine:
 
         # Generate verdict (with retry on citation validation failure)
         for attempt in range(3):
-            response = await self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            response = await self.client.messages.create(
+                model="claude-sonnet-4-20250514",
                 max_tokens=1500,
                 messages=[{"role": "user", "content": prompt}],
             )
 
-            text = response.choices[0].message.content.strip()
+            text = response.content[0].text.strip()
             verdict = self._parse_verdict(text)
 
             if verdict and self._validate_citations(verdict, evidence):
-                verdict["model_used"] = "gemini-2.0-flash"
+                verdict["model_used"] = "claude-sonnet-4-20250514"
                 verdict["prompt_hash"] = hashlib.sha256(prompt.encode()).hexdigest()[:16]
                 log.info(
                     "verdict_generate_done",

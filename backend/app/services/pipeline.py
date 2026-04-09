@@ -7,8 +7,8 @@ import asyncio
 import json
 from datetime import datetime, timezone
 
+import anthropic
 import structlog
-from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,10 +30,7 @@ class PipelineOrchestrator:
         self.detector = ClaimDetector()
         self.retriever = EvidenceRetriever()
         self.verdict_engine = VerdictEngine()
-        self.groq_client = AsyncOpenAI(
-            api_key=settings.groq_api_key,
-            base_url="https://api.groq.com/openai/v1",
-        )
+        self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     async def process_clip(self, session_id: str) -> None:
         """Process a clip through the full pipeline."""
@@ -159,13 +156,13 @@ Respond ONLY with a JSON object:
 
         for attempt in range(3):
             try:
-                response = await self.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                response = await self.anthropic_client.messages.create(
+                    model="claude-sonnet-4-20250514",
                     max_tokens=300,
                     messages=[{"role": "user", "content": prompt}],
                 )
 
-                result_text = (response.choices[0].message.content or "").strip()
+                result_text = response.content[0].text.strip()
                 if result_text.startswith("```"):
                     result_text = result_text.split("\n", 1)[1]
                 if result_text.endswith("```"):
@@ -662,13 +659,13 @@ Return ONLY the JSON array, no other text."""
 
         for attempt in range(3):
             try:
-                response = await self.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                response = await self.anthropic_client.messages.create(
+                    model="claude-sonnet-4-20250514",
                     max_tokens=2000,
                     messages=[{"role": "user", "content": prompt}],
                 )
 
-                result_text = (response.choices[0].message.content or "").strip()
+                result_text = response.content[0].text.strip()
                 if result_text.startswith("```"):
                     result_text = result_text.split("\n", 1)[1]
                 if result_text.endswith("```"):
@@ -888,13 +885,13 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
 
             for attempt in range(3):
                 try:
-                    response = await self.groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                    response = await self.anthropic_client.messages.create(
+                        model="claude-sonnet-4-20250514",
                         max_tokens=1024,
                         messages=[{"role": "user", "content": prompt}],
                     )
 
-                    result_text = (response.choices[0].message.content or "").strip()
+                    result_text = response.content[0].text.strip()
                     if result_text.startswith("```"):
                         result_text = result_text.split("\n", 1)[1]
                     if result_text.endswith("```"):
@@ -1191,13 +1188,13 @@ Transcript:
 {chunk_text}"""
 
             try:
-                response = await self.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                response = await self.anthropic_client.messages.create(
+                    model="claude-sonnet-4-20250514",
                     max_tokens=4000,
                     messages=[{"role": "user", "content": prompt}],
                 )
 
-                text = (response.choices[0].message.content or "").strip()
+                text = response.content[0].text.strip()
                 if text.startswith("```"):
                     text = text.split("\n", 1)[1]
                 if text.endswith("```"):

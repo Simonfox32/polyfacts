@@ -7,8 +7,8 @@ Stage 2: Claude Haiku structured extraction (normalized claim struct)
 import json
 import re
 
+import anthropic
 import structlog
-from openai import AsyncOpenAI
 
 from app.config import settings
 
@@ -44,10 +44,7 @@ Speaker: {speaker}"""
 
 class ClaimDetector:
     def __init__(self):
-        self.client = AsyncOpenAI(
-            api_key=settings.groq_api_key,
-            base_url="https://api.groq.com/openai/v1",
-        )
+        self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         self._classifier = None
 
     async def score_claim_worthiness(self, sentence: str) -> float:
@@ -262,12 +259,12 @@ class ClaimDetector:
             "Is this a checkable, important factual claim? (yes/no)"
         )
         try:
-            response = await self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            response = await self.client.messages.create(
+                model="claude-sonnet-4-20250514",
                 max_tokens=5,
                 messages=[{"role": "user", "content": prompt}],
             )
-            answer = response.choices[0].message.content.strip().lower()
+            answer = response.content[0].text.strip().lower()
             return answer.startswith("yes")
         except Exception:
             return True  # On error, let the claim through
@@ -282,13 +279,13 @@ class ClaimDetector:
             speaker=speaker or "Unknown",
         )
 
-        response = await self.client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        response = await self.client.messages.create(
+            model="claude-sonnet-4-20250514",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
         )
 
-        text = response.choices[0].message.content.strip()
+        text = response.content[0].text.strip()
         # Strip markdown code fences if present
         if text.startswith("```"):
             text = text.split("\n", 1)[1]
