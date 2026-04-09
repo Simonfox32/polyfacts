@@ -191,9 +191,22 @@ async def _download_and_process_url(session_id: str, source_url: str) -> None:
                 if rc == 0:
                     actual_path = _resolve_downloaded_file(download_base)
 
+            # Audio-only fallback (works better on datacenter IPs)
+            if actual_path is None:
+                rc, _, stderr_out = await _run_ytdlp([
+                    "yt-dlp",
+                    "--no-playlist",
+                    "-x", "--audio-format", "mp3",
+                    "-o", f"{download_base}.%(ext)s",
+                    source_url,
+                ])
+                log.info("ytdlp_attempt_3_audio", rc=rc, stderr=stderr_out[:500] if stderr_out else "")
+                if rc == 0:
+                    actual_path = _resolve_downloaded_file(download_base)
+
             if actual_path is None:
                 session.status = "error"
-                session.error_message = "Failed to download media from URL"
+                session.error_message = f"Download failed: {stderr_out[:300] if stderr_out else 'unknown error'}"
                 await db.commit()
                 return
 
