@@ -269,21 +269,33 @@ Respond ONLY with a JSON object:
         return identified
 
     def _collect_all_name_mentions(self, segments: list) -> list[str]:
-        """Collect all title+name mentions from the transcript for LLM context."""
+        """Collect all name mentions from the transcript for LLM context."""
         import re
 
-        title_pattern = re.compile(
+        # Title before name: "Senator Smith", "Director Patel"
+        title_before = re.compile(
             r"\b(Senator|Representative|Congressman|Congresswoman|Secretary|"
             r"Attorney General|General|Governor|Mayor|President|Vice President|"
             r"Chairman|Chairwoman|Director|Ambassador|Justice|Judge|Dr\.|Professor)\s+"
             r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"
         )
 
+        # Name followed by title/role: "Harry Enten, Chief Data Analyst"
+        name_then_title = re.compile(
+            r"\b([A-Z][a-z]+\s+[A-Z][a-z]+),?\s+"
+            r"(?:Chief|Senior|Lead|Deputy|Assistant|Associate|Former|Acting)?\s*"
+            r"(?:Data |Political |National |White House |Legal )?"
+            r"(?:Analyst|Correspondent|Reporter|Anchor|Host|Commentator|Editor|"
+            r"Strategist|Advisor|Adviser|Director|Secretary|Producer|Journalist)\b"
+        )
+
         names = set()
         for seg in segments:
             text = seg.get("text", "")
-            for title, name in title_pattern.findall(text):
+            for title, name in title_before.findall(text):
                 names.add(f"{title} {name}")
+            for match in name_then_title.finditer(text):
+                names.add(match.group(0).rstrip(","))
         return sorted(names)
 
     @staticmethod
@@ -1009,6 +1021,54 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
                             name=senator_names[0],
                         )
                         break
+
+        # Fallback: if speakers are still unidentified, try matching names mentioned
+        # in the transcript to speakers based on introduction patterns.
+        # E.g., "Harry Enten, Chief Data Analyst" at segment start = that speaker is Harry Enten
+        remaining_unidentified = [l for l in unique_speakers if l not in speaker_map]
+        if remaining_unidentified and all_names_mentioned:
+            import re as _re
+
+            # Build a lookup of name → full title from all_names_mentioned
+            name_lookup = {}
+            for nm in all_names_mentioned:
+                # Extract just the last name for matching
+                parts = nm.split()
+                if len(parts) >= 2:
+                    last_name = parts[-1].lower()
+                    name_lookup[last_name] = nm
+
+            for label in remaining_unidentified:
+                speaker_segs = [s for s in merged_segments if s.get("speaker_label") == label]
+                for seg in speaker_segs[:5]:  # Check first few segments
+                    text = seg["text"]
+                    # Check if any known name appears at the start of this segment
+                    # (anchors/hosts often introduce themselves or are introduced)
+                    for last_name, full_name in name_lookup.items():
+                        if last_name in text.lower()[:100]:
+                            speaker_map[label] = {"name": full_name, "party": None}
+                            log.info("speaker_assigned_from_transcript_name",
+                                     label=label, name=full_name)
+                            break
+                    if label in speaker_map:
+                        break
+
+            # Second pass: if only one speaker remains unidentified and one name is unused,
+            # assign by elimination
+            still_unidentified = [l for l in unique_speakers if l not in speaker_map]
+            used_names = {
+                (info.get("name", "") if isinstance(info, dict) else info).lower()
+                for info in speaker_map.values()
+            }
+            unused_names = [
+                nm for nm in all_names_mentioned
+                if nm.lower() not in used_names
+                and not any(nm.lower() in u for u in used_names)
+            ]
+            if len(still_unidentified) == 1 and len(unused_names) == 1:
+                speaker_map[still_unidentified[0]] = {"name": unused_names[0], "party": None}
+                log.info("speaker_assigned_by_elimination",
+                         label=still_unidentified[0], name=unused_names[0])
 
         # Apply the mapping to all segments
         for seg in segments:
