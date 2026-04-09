@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -7,6 +8,16 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = "postgresql+asyncpg://localhost:5432/polyfacts"
+
+    @model_validator(mode="after")
+    def _fix_database_url(self):
+        """Ensure database_url uses asyncpg driver for SQLAlchemy async engine."""
+        url = self.database_url
+        if url.startswith("postgres://"):
+            self.database_url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgresql://") and "+asyncpg" not in url:
+            self.database_url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return self
 
     # Redis
     redis_url: str = "redis://localhost:6379"
