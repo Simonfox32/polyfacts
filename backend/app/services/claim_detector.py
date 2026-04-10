@@ -4,6 +4,7 @@ Stage 1: Heuristic claim worthiness classifier (fast, CPU) — V1: fine-tuned De
 Stage 2: Claude Haiku structured extraction (normalized claim struct)
 """
 
+import asyncio
 import json
 import re
 
@@ -46,6 +47,19 @@ class ClaimDetector:
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         self._classifier = None
+
+    async def _call_anthropic(self, **kwargs):
+        """Call Anthropic API with retry on overloaded (529) errors."""
+        for attempt in range(4):
+            try:
+                return await self.client.messages.create(**kwargs)
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and attempt < 3:
+                    wait = (attempt + 1) * 10
+                    log.warning("anthropic_overloaded_retry", attempt=attempt, wait=wait)
+                    await asyncio.sleep(wait)
+                else:
+                    raise
 
     async def score_claim_worthiness(self, sentence: str) -> float:
         """Score a sentence for claim-worthiness (0-1).
@@ -259,7 +273,7 @@ class ClaimDetector:
             "Is this a checkable, important factual claim? (yes/no)"
         )
         try:
-            response = await self.client.messages.create(
+            response = await self._call_anthropic(
                 model="claude-sonnet-4-20250514",
                 max_tokens=5,
                 messages=[{"role": "user", "content": prompt}],
@@ -279,7 +293,7 @@ class ClaimDetector:
             speaker=speaker or "Unknown",
         )
 
-        response = await self.client.messages.create(
+        response = await self._call_anthropic(
             model="claude-sonnet-4-20250514",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],

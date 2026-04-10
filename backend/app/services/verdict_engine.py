@@ -3,6 +3,7 @@
 Enforces mandatory retrieval before generation and validates citations.
 """
 
+import asyncio
 import hashlib
 import json
 import re
@@ -54,6 +55,19 @@ class VerdictEngine:
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+    async def _call_anthropic(self, **kwargs):
+        """Call Anthropic API with retry on overloaded (529) errors."""
+        for attempt in range(4):
+            try:
+                return await self.client.messages.create(**kwargs)
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and attempt < 3:
+                    wait = (attempt + 1) * 10
+                    log.warning("anthropic_overloaded_retry", attempt=attempt, wait=wait)
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
     async def generate_verdict(
         self,
         claim_text: str,
@@ -103,7 +117,7 @@ class VerdictEngine:
 
         # Generate verdict (with retry on citation validation failure)
         for attempt in range(3):
-            response = await self.client.messages.create(
+            response = await self._call_anthropic(
                 model="claude-sonnet-4-20250514",
                 max_tokens=1500,
                 messages=[{"role": "user", "content": prompt}],

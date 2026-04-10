@@ -3,6 +3,7 @@
 Uses Reciprocal Rank Fusion to merge keyword and semantic results.
 """
 
+import asyncio
 import json
 import time
 from collections import defaultdict
@@ -27,6 +28,19 @@ class EvidenceRetriever:
         self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self._api_cache: dict[str, dict] = {}
+
+    async def _call_anthropic(self, **kwargs):
+        """Call Anthropic API with retry on overloaded (529) errors."""
+        for attempt in range(4):
+            try:
+                return await self.anthropic_client.messages.create(**kwargs)
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and attempt < 3:
+                    wait = (attempt + 1) * 10
+                    log.warning("anthropic_overloaded_retry", attempt=attempt, wait=wait)
+                    await asyncio.sleep(wait)
+                else:
+                    raise
 
     def _cache_key(self, api: str, identifier: str) -> str:
         return f"{api}:{identifier}"
@@ -114,7 +128,7 @@ class EvidenceRetriever:
         )
 
         try:
-            response = await self.anthropic_client.messages.create(
+            response = await self._call_anthropic(
                 model="claude-sonnet-4-20250514",
                 max_tokens=512,
                 messages=[{

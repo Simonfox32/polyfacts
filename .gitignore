@@ -75,3 +75,5 @@ uploads/*
 !backend/uploads/
 backend/uploads/*
 !backend/uploads/.gitkeep
+.vercel
+.env*.local

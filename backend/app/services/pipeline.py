@@ -32,6 +32,19 @@ class PipelineOrchestrator:
         self.verdict_engine = VerdictEngine()
         self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+    async def _call_anthropic(self, **kwargs):
+        """Call Anthropic API with retry on overloaded (529) errors."""
+        for attempt in range(4):
+            try:
+                return await self.anthropic_client.messages.create(**kwargs)
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and attempt < 3:
+                    wait = (attempt + 1) * 10
+                    log.warning("anthropic_overloaded_retry", attempt=attempt, wait=wait)
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
     async def process_clip(self, session_id: str) -> None:
         """Process a clip through the full pipeline."""
         result = await self.db.execute(select(Session).where(Session.id == session_id))
@@ -156,7 +169,7 @@ Respond ONLY with a JSON object:
 
         for attempt in range(3):
             try:
-                response = await self.anthropic_client.messages.create(
+                response = await self._call_anthropic(
                     model="claude-sonnet-4-20250514",
                     max_tokens=300,
                     messages=[{"role": "user", "content": prompt}],
@@ -470,7 +483,7 @@ Respond ONLY with a JSON object:
                 ),
             })
 
-            response = await self.anthropic_client.messages.create(
+            response = await self._call_anthropic(
                 model="claude-sonnet-4-20250514",
                 max_tokens=800,
                 messages=[{"role": "user", "content": content}],
@@ -715,7 +728,7 @@ Return ONLY the JSON array, no other text."""
 
         for attempt in range(3):
             try:
-                response = await self.anthropic_client.messages.create(
+                response = await self._call_anthropic(
                     model="claude-sonnet-4-20250514",
                     max_tokens=2000,
                     messages=[{"role": "user", "content": prompt}],
@@ -941,7 +954,7 @@ Include ALL speaker labels from the transcript. Use null for party if unknown or
 
             for attempt in range(3):
                 try:
-                    response = await self.anthropic_client.messages.create(
+                    response = await self._call_anthropic(
                         model="claude-sonnet-4-20250514",
                         max_tokens=1024,
                         messages=[{"role": "user", "content": prompt}],
@@ -1414,7 +1427,7 @@ Transcript:
 {chunk_text}"""
 
             try:
-                response = await self.anthropic_client.messages.create(
+                response = await self._call_anthropic(
                     model="claude-sonnet-4-20250514",
                     max_tokens=4000,
                     messages=[{"role": "user", "content": prompt}],
