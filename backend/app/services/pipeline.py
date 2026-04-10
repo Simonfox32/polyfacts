@@ -1551,6 +1551,8 @@ Transcript:
             # Compute a worthiness score for the record
             score = await self.detector.score_claim_worthiness(claim_text)
 
+            best_start, best_end = self._find_best_timestamp(seg, claim_text)
+
             claim = Claim(
                 session_id=session_id,
                 claim_text=claim_text,
@@ -1558,8 +1560,8 @@ Transcript:
                 time_scope=struct.get("time_scope"),
                 location_scope=struct.get("location_scope"),
                 speaker_label=seg.get("speaker_label"),
-                start_ms=seg["start_ms"],
-                end_ms=seg["end_ms"],
+                start_ms=best_start,
+                end_ms=best_end,
                 claim_type=claim_type,
                 claim_worthiness_score=max(score, 0.5),  # LLM-selected claims get min 0.5
                 required_evidence_types=struct.get("required_evidence_types"),
@@ -1617,11 +1619,17 @@ Transcript:
 
     @staticmethod
     def _merge_adjacent_segments(segments: list[dict]) -> list[dict]:
-        """Merge adjacent segments from the same speaker into longer utterances."""
+        """Merge adjacent segments from the same speaker into longer utterances.
+
+        Each merged segment keeps an '_original_segments' list so that claim
+        timestamps can be mapped back to the correct position within the merge.
+        """
         if not segments:
             return []
 
-        merged = [dict(segments[0])]  # copy first segment
+        first = dict(segments[0])
+        first["_original_segments"] = [{"text": segments[0]["text"], "start_ms": segments[0]["start_ms"], "end_ms": segments[0]["end_ms"]}]
+        merged = [first]
         for seg in segments[1:]:
             prev = merged[-1]
             # Merge if same speaker and gap < 2 seconds
@@ -1631,10 +1639,38 @@ Transcript:
             ):
                 prev["text"] = prev["text"].rstrip() + " " + seg["text"].lstrip()
                 prev["end_ms"] = seg["end_ms"]
+                prev["_original_segments"].append({"text": seg["text"], "start_ms": seg["start_ms"], "end_ms": seg["end_ms"]})
             else:
-                merged.append(dict(seg))
+                new_seg = dict(seg)
+                new_seg["_original_segments"] = [{"text": seg["text"], "start_ms": seg["start_ms"], "end_ms": seg["end_ms"]}]
+                merged.append(new_seg)
 
         return merged
+
+    @staticmethod
+    def _find_best_timestamp(seg: dict, claim_text: str) -> tuple[int, int]:
+        """Find the best start_ms/end_ms for a claim within a merged segment.
+
+        Searches original sub-segments for the best text overlap with the claim.
+        """
+        originals = seg.get("_original_segments", [])
+        if not originals or len(originals) == 1:
+            return seg["start_ms"], seg["end_ms"]
+
+        claim_words = set(claim_text.lower().split())
+        best_overlap = -1
+        best_start = seg["start_ms"]
+        best_end = seg["end_ms"]
+
+        for orig in originals:
+            orig_words = set(orig["text"].lower().split())
+            overlap = len(claim_words & orig_words)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_start = orig["start_ms"]
+                best_end = orig["end_ms"]
+
+        return best_start, best_end
 
     async def _store_evidence(self, claim: Claim, evidence: list[dict]) -> None:
         for e in evidence:

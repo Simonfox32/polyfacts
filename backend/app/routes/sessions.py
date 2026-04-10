@@ -96,6 +96,18 @@ async def get_session_detail(session_id: str, db: AsyncSession = Depends(get_db)
         if claim.speaker_label:
             speakers.add(claim.speaker_label)
 
+    # Also collect speakers from transcript segments
+    transcript_speakers = (
+        await db.execute(
+            select(TranscriptSegment.speaker_label)
+            .where(TranscriptSegment.session_id == session_id)
+            .distinct()
+        )
+    ).scalars().all()
+    for sp in transcript_speakers:
+        if sp:
+            speakers.add(sp)
+
     return SessionDetailResponse(
         session_id=session.id,
         title=session.title,
